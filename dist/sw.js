@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v15)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v16)
 
-const VERSION = "v1.0.0-202603142201";
+const VERSION = "v1.0.0-202603142214";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 80;
@@ -25,43 +25,75 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 【防逃逸】拦截因相对路径导致的脱离代理
-    if (!isProxyRequest(url)) {
-        if (req.referrer) {
-            try {
-                let refUrl = new URL(req.referrer);
-                if (isProxyRequest(refUrl)) {
-                    let targetBaseOrigin = getTargetOrigin(refUrl);
-                    if (targetBaseOrigin) {
-                        let correctUrl = `${url.origin}/${targetBaseOrigin}${url.pathname}${url.search}${url.hash}`;
-                        if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
-                        const newReq = new Request(correctUrl, req);
-                        return event.respondWith(fetch(newReq));
-                    }
-                }
-            } catch (e) {}
-        }
+    // 1. 本地静态资源放行 (如 /sw.js)
+    if (url.origin === self.location.origin && !isProxyRequest(url)) {
         return;
     }
 
-    // 【核心修复 1】视频流与表单提交，绝对交由浏览器原生网络引擎！不缓存，不拆解！
-    if (req.method !== "GET" && req.method !== "HEAD") return event.respondWith(fetch(req));
-    if (req.headers.has("range") || url.pathname.includes("videoplayback")) return event.respondWith(fetch(req));
+    // 2. 【终极逃逸捕获网】拦截 Web Worker、JS 相对路径、隐藏 API 发起的脱离代理请求
+    if (!isProxyRequest(url) && url.origin !== self.location.origin) {
+        let correctUrl = `${self.location.origin}/${url.href}`;
+        if (req.mode === 'navigate') {
+            return event.respondWith(Response.redirect(correctUrl, 302));
+        }
+        const fetchOpts = {
+            method: req.method,
+            headers: req.headers,
+            redirect: "manual",
+            mode: req.mode === 'navigate' ? 'cors' : req.mode,
+            credentials: req.credentials
+        };
+        if (req.body && req.method !== 'GET' && req.method !== 'HEAD') {
+            fetchOpts.body = req.body;
+            fetchOpts.duplex = 'half';
+        }
+        return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
+    }
 
+    // 3. 【解决 59 秒断流与提交死循环】媒体流与非 GET 请求，绝对不拆包，纯管道直通！
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
+    }
+    if (req.headers.has("range") || url.pathname.includes("videoplayback")) {
+        return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
+    }
+
+    // 4. HTML 与 XML：网络优先
     if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
         return event.respondWith(handleDocumentRequest(req));
     }
 
+    // 5. 静态资源：极速缓存
     event.respondWith(handleStaticResource(req));
 });
+
+// 处理重定向死循环：确保 302/301 跳转被正确控制在代理域内
+function processRedirectResponse(response, reqUrl) {
+    if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (location) {
+            const proxyOrigin = new URL(reqUrl).origin;
+            // 如果后端返回的 Location 已经是代理地址，直接返回防止无限嵌套
+            if (location.startsWith(proxyOrigin + "/http")) {
+                return response;
+            }
+            try {
+                const absoluteLoc = new URL(location, getTargetOrigin(new URL(reqUrl))).href;
+                return new Response(null, { status: response.status, headers: { "Location": `${proxyOrigin}/${absoluteLoc}` } });
+            } catch {}
+        }
+    }
+    return response;
+}
 
 async function handleDocumentRequest(req) {
     try {
         const res = await fetch(req);
-        if (res.ok) {
-            caches.open(DYNAMIC_CACHE).then(c => { c.put(req, res.clone()).catch(()=>{}); trimCache(); });
+        const processed = processRedirectResponse(res, req.url);
+        if (processed.ok) {
+            caches.open(DYNAMIC_CACHE).then(c => { c.put(req, processed.clone()).catch(()=>{}); trimCache(); });
         }
-        return res;
+        return processed;
     } catch { 
         return (await caches.match(req)) || new Response("Proxy Offline", { status: 504 }); 
     }
@@ -71,16 +103,16 @@ async function handleStaticResource(req) {
     const cache = await caches.open(DYNAMIC_CACHE);
     const cachedRes = await cache.match(req);
     const networkPromise = fetch(req).then(res => {
-        if (res.ok && res.status === 200) {
-            const size = Number(res.headers.get("content-length") || 0);
+        const processed = processRedirectResponse(res, req.url);
+        if (processed.ok && processed.status === 200) {
+            const size = Number(processed.headers.get("content-length") || 0);
             if (size > 0 && size < MAX_CACHE_SIZE_MB * 1024 * 1024) {
-                cache.put(req, res.clone()).catch(()=>{});
+                cache.put(req, processed.clone()).catch(()=>{});
                 trimCache();
             }
         }
-        return res;
+        return processed;
     }).catch(() => null);
-    
     return cachedRes || networkPromise || new Response("Unavailable", { status: 503 });
 }
 
