@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - YouTube & Google Ultimate Final)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate SPA v15)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -24,12 +24,13 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
 
-    // 【核心修复 2】：强制接管 OPTIONS 跨域预检，完美支持 YouTube 留言 API 与 Google reCAPTCHA
+    // 【解决 YouTube 留言/登录 CORS 问题】
     if (request.method === "OPTIONS") {
+        let origin = request.headers.get("Origin");
         return new Response(null, {
             status: 204,
             headers: {
-                "Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
+                "Access-Control-Allow-Origin": origin || "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
                 "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
                 "Access-Control-Max-Age": "86400",
@@ -40,21 +41,21 @@ async function handleRequest(request, env) {
 
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
-    headers.set("Origin", target.origin);
 
-    // Typecho 真实来源 URL 还原引擎
+    // 【解决媒体服务器鉴权拒绝】动态提取真实 Origin 和 Referer
     const clientReferer = request.headers.get("Referer");
+    let trueOrigin = target.origin;
     if (clientReferer) {
         try {
             const parsedClientRef = new URL(clientReferer);
-            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "");
-            refPath = refPath.replace(/^(https?):\/+/, "$1://");
-            if (refPath.startsWith("http")) headers.set("Referer", refPath);
-            else headers.set("Referer", target.href);
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
+            if (refPath.startsWith("http")) {
+                headers.set("Referer", refPath);
+                trueOrigin = new URL(refPath).origin; // 骗过媒体服务器，声称我们来自 youtube.com
+            } else { headers.set("Referer", target.href); }
         } catch { headers.set("Referer", target.href); }
-    } else {
-        headers.set("Referer", target.href);
-    }
+    } else { headers.set("Referer", target.href); }
+    headers.set("Origin", trueOrigin);
     
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
@@ -67,57 +68,63 @@ async function handleRequest(request, env) {
     const response = await fetch(target, fetchOpts);
     const newHeaders = new Headers(response.headers);
     
-    sanitizeHeaders(newHeaders, request);
-    rewriteLocation(response, newHeaders, url, target); // Typecho 的 302 在此被完美重写，且不会被 SW 二次嵌套
+    let contentType = newHeaders.get("content-type") || "";
+    let contentLength = Number(newHeaders.get("content-length") || 0);
+    const fetchDest = request.headers.get("sec-fetch-dest");
+
+    // 判断是否需要进行 Body 重写
+    const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
+    const isCSS = contentType.includes("text/css");
+    const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
+    const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
+
+    // 【解决视频 1 分钟断流】：分离式清洗头。如果是视频，绝对保留 content-length！
+    sanitizeHeaders(newHeaders, request, shouldRewriteBody);
+    rewriteLocation(response, newHeaders, url, target); // 解决 Typecho 死循环的核心
     rewriteCookies(newHeaders, url);
 
     if (request.headers.get("Upgrade") === "websocket") {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    // 【性能狂飙】：对于图像、视频段 (videoplayback)、音频、API JSON 数据，绝对不进入 HTMLRewriter，保证 0 损耗与不损坏！
-    const fetchDest = request.headers.get("sec-fetch-dest");
-    let contentType = newHeaders.get("content-type") || "";
-    if (["image", "video", "audio", "font", "style", "script"].includes(fetchDest) || 
-        target.pathname.includes("avatar.php") || 
-        target.pathname.includes("captcha") ||
-        target.pathname.includes("videoplayback") ||
-        contentType.includes("video/") ||
-        contentType.includes("audio/") ||
-        contentType.includes("image/") ||
-        contentType.includes("application/json")
-    ) {
+    // 遇到视频、图片、JSON，直接原样下发管道！
+    if (!shouldRewriteBody) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    let contentLength = Number(newHeaders.get("content-length") || 0);
-
-    if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) {
-        return rewriteHTML(response, newHeaders, url, target);
-    }
-    if ((contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt")) && contentLength < MAX_REWRITE_SIZE) {
-        return rewriteTextResource(response, newHeaders, url, target);
-    }
-    if (contentType.includes("text/css") && contentLength < MAX_REWRITE_SIZE) {
-        return rewriteCSSResponse(response, newHeaders, url, target);
-    }
+    if (isHTML) return rewriteHTML(response, newHeaders, url, target);
+    if (isXML) return rewriteTextResource(response, newHeaders, url, target);
+    if (isCSS) return rewriteCSSResponse(response, newHeaders, url, target);
 
     return new Response(response.body, { status: response.status, headers: newHeaders });
 }
 
-function sanitizeHeaders(headers, request) {
-    ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data", "content-encoding", "content-length"].forEach(h => headers.delete(h));
-    headers.set("Access-Control-Allow-Origin", request.headers.get("Origin") || "*");
-    headers.set("Access-Control-Allow-Credentials", "true");
+function sanitizeHeaders(headers, request, shouldRewriteBody) {
+    ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data"].forEach(h => headers.delete(h));
+    
+    // 如果修改了内容，才删除长度和压缩标示；否则保留（对流媒体至关重要）
+    if (shouldRewriteBody) {
+        headers.delete("content-encoding");
+        headers.delete("content-length");
+    }
+
+    let origin = request.headers.get("Origin");
+    headers.set("Access-Control-Allow-Origin", origin || "*");
+    if (origin) headers.set("Access-Control-Allow-Credentials", "true");
 }
 
 function rewriteLocation(response, headers, proxy, target) {
     let loc = response.headers.get("location");
     if (!loc) return;
-    try { headers.set("location", proxy.origin + "/" + new URL(loc, target).href); } catch {}
+    try {
+        let absoluteLoc = new URL(loc, target).href;
+        // 如果源站返回的已经是我们的代理格式，不要再嵌套（防死循环终极保险）
+        if (!absoluteLoc.startsWith(proxy.origin)) {
+            headers.set("location", proxy.origin + "/" + absoluteLoc);
+        }
+    } catch {}
 }
 
-// 【核心修复 3】：跨站鉴权保全，注入 SameSite=None 防止 Google/YouTube 账号登录失效
 function rewriteCookies(headers, proxy) {
     if (typeof headers.getSetCookie === 'function') {
         const cookies = headers.getSetCookie();
@@ -155,13 +162,11 @@ function rewriteHTML(res, headers, proxy, target) {
         .on("script, link", new RemoveIntegrity())
         .on("link[rel='canonical'], link[rel='alternate'], base[href]", new URLRewriter(proxy, target, "href"))
         .on("meta[property='og:url'], meta[property='og:image'], meta[name='twitter:url'], meta[name='twitter:image']", new URLRewriter(proxy, target, "content"))
-        .on("meta[http-equiv='refresh']", new MetaRefreshRewriter(proxy, target))
-        .on("script[type='application/ld+json']", new TextNodeRewriter(proxy, target))
         .on("a[href], link[href]", new URLRewriter(proxy, target, "href"))
         .on("img[src], iframe[src], script[src], source[src]", new URLRewriter(proxy, target, "src"))
         .on("img[srcset], source[srcset]", new SrcsetRewriter(proxy, target))
         .on("form[action]", new URLRewriter(proxy, target, "action"))
-        .on("[data-src],[data-url],[data-href], [data-video],[data-aff], [data-poster]", new DataAttributeRewriter(proxy, target))
+        .on("[data-src],[data-url],[data-href],[data-video],[data-aff],[data-poster]", new DataAttributeRewriter(proxy, target))
         .transform(new Response(res.body, { status: res.status, headers }));
 }
 
@@ -200,42 +205,15 @@ class SrcsetRewriter {
     }
 }
 
-class MetaRefreshRewriter {
-    constructor(proxy, target) { this.proxy = proxy; this.target = target; }
-    element(el) {
-        let val = el.getAttribute("content");
-        if (!val) return;
-        let match = val.match(/^(\d+;\s*url=)(.+)$/i);
-        if (match) {
-            try { el.setAttribute("content", match[1] + this.proxy.origin + "/" + new URL(match[2].replace(/['"]/g, "").trim(), this.target).href); } catch {}
-        }
-    }
-}
-
-class TextNodeRewriter {
-    constructor(proxy, target) { 
-        this.proxy = proxy; this.target = target; 
-        this.regex = new RegExp(target.origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-        this.replacement = proxy.origin + "/" + target.origin;
-    }
-    text(chunk) {
-        if (chunk.text && chunk.text.includes(this.target.origin)) {
-            chunk.replace(chunk.text.replace(this.regex, this.replacement), { html: false });
-        }
-    }
-}
-
 function homepage(url) {
     return new Response(`
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>UPP Proxy Node</title>
-<meta name="robots" content="index, follow"></head><body style="font-family:sans-serif;text-align:center;padding:10vh 20px;">
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>UPP Proxy Node</title></head><body style="font-family:sans-serif;text-align:center;padding:10vh 20px;">
 <h2>UPP Proxy Pages Engine</h2><p>Gateway is Active.</p>
-<div style="background:#f4f4f4;padding:15px;border-radius:8px;display:inline-block;margin-top:20px;">
-Usage: <code>${url.origin}/https://example.com</code></div></body></html>`, 
+<div style="background:#f4f4f4;padding:15px;border-radius:8px;display:inline-block;margin-top:20px;">Usage: <code>${url.origin}/https://example.com</code></div></body></html>`, 
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// 【核心修复 4】：强行修改浏览器原生 API 行为，强制所有 XHR/Fetch 附带鉴权 Cookie
+// 【解决 YouTube 侧栏 SPA 动态路由加载脱离问题的终极杀器】
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
@@ -243,13 +221,13 @@ class InjectSandbox {
 <script>
 window.__UP_TARGET="${this.target.origin}";
 
+// 1. Fetch 与 XHR 拦截 (防 API 逃脱，保证 Credentials)
 const _fetch=window.fetch;
 window.fetch=async(u,opt)=>{
     try{
         if(typeof u==="string"||u instanceof URL){let ur=new URL(u.toString(),window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=location.origin+"/"+ur.href;}
         else if(u instanceof Request){let ur=new URL(u.url,window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=new Request(location.origin+"/"+ur.href,u);}
     }catch(e){}
-    // YouTube / Google 评论登录强依赖 credentials
     if(opt && typeof opt === 'object' && !opt.credentials) opt.credentials="include";
     else if(!opt) opt={credentials:"include"};
     return _fetch(u,opt);
@@ -260,12 +238,60 @@ XMLHttpRequest.prototype.open=function(m,u,...r){
     if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}
     return _open.call(this,m,u,...r);
 };
-// 劫持 XHR 发送环节，强制设置 withCredentials 支持跨站 Cookie
 const _send=XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.send=function(b){
-    this.withCredentials=true;
-    return _send.call(this,b);
+XMLHttpRequest.prototype.send=function(b){this.withCredentials=true; return _send.call(this,b);};
+
+// 2. 拦截 History API (修复 YouTube SPA 单页跳转防逃脱)
+const _push = history.pushState;
+history.pushState = function(state, title, url) {
+    if (url) {
+        try {
+            let p = new URL(url, window.__UP_TARGET);
+            if (p.protocol.startsWith('http')) url = location.origin + "/" + p.href;
+        } catch(e){}
+    }
+    return _push.call(this, state, title, url);
 };
+const _replace = history.replaceState;
+history.replaceState = function(state, title, url) {
+    if (url) {
+        try {
+            let p = new URL(url, window.__UP_TARGET);
+            if (p.protocol.startsWith('http')) url = location.origin + "/" + p.href;
+        } catch(e){}
+    }
+    return _replace.call(this, state, title, url);
+};
+
+// 3. DOM 动态嗅探器 (修复 YouTube 侧栏 JS 延迟渲染导致节点无法被 Worker 重写的致命 Bug)
+const observer = new MutationObserver(mutations => {
+    mutations.forEach(m => {
+        m.addedNodes.forEach(n => {
+            if (n.nodeType === 1) { // 如果是元素节点
+                const fixAttr = (node) => {
+                    ['href', 'src', 'action'].forEach(attr => {
+                        if (node.hasAttribute && node.hasAttribute(attr)) {
+                            let val = node.getAttribute(attr);
+                            if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(location.origin)) {
+                                try {
+                                    let abs = new URL(val, window.__UP_TARGET);
+                                    if (abs.protocol.startsWith('http')) {
+                                        node.setAttribute(attr, location.origin + "/" + abs.href);
+                                    }
+                                } catch(e){}
+                            }
+                        }
+                    });
+                };
+                fixAttr(n);
+                if (n.querySelectorAll) {
+                    n.querySelectorAll('[href], [src],[action]').forEach(fixAttr);
+                }
+            }
+        });
+    });
+});
+observer.observe(document.documentElement, { childList: true, subtree: true });
 
 const _openWin=window.open;
 window.open=function(u,t,f){if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}return _openWin.call(window,u,t,f);};
