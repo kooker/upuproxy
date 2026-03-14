@@ -1,0 +1,4 @@
+name = "upp-proxy-pages"
+compatibility_date = "2026-03-14"
+compatibility_flags = ["transformstream_enable_standard_constructor"]
+pages_build_output_dir = "dist"
