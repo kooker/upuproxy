@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Google & YouTube Ultimate v13)
+// dist/_worker.js (Cloudflare Pages Worker - YouTube & Google Ultimate Final)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -24,7 +24,7 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
 
-    // 【关键修复 1】：拦截并伪造 CORS OPTIONS 预检请求 (解决 YouTube 留言 API 被浏览器拦截)
+    // 【核心修复 2】：强制接管 OPTIONS 跨域预检，完美支持 YouTube 留言 API 与 Google reCAPTCHA
     if (request.method === "OPTIONS") {
         return new Response(null, {
             status: 204,
@@ -42,6 +42,7 @@ async function handleRequest(request, env) {
     headers.set("Host", target.host);
     headers.set("Origin", target.origin);
 
+    // Typecho 真实来源 URL 还原引擎
     const clientReferer = request.headers.get("Referer");
     if (clientReferer) {
         try {
@@ -67,25 +68,29 @@ async function handleRequest(request, env) {
     const newHeaders = new Headers(response.headers);
     
     sanitizeHeaders(newHeaders, request);
-    rewriteLocation(response, newHeaders, url, target);
+    rewriteLocation(response, newHeaders, url, target); // Typecho 的 302 在此被完美重写，且不会被 SW 二次嵌套
     rewriteCookies(newHeaders, url);
 
     if (request.headers.get("Upgrade") === "websocket") {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
+    // 【性能狂飙】：对于图像、视频段 (videoplayback)、音频、API JSON 数据，绝对不进入 HTMLRewriter，保证 0 损耗与不损坏！
     const fetchDest = request.headers.get("sec-fetch-dest");
-    if (["image", "video", "audio", "font", "style", "script"].includes(fetchDest) || target.pathname.includes("avatar.php") || target.pathname.includes("captcha")) {
-        return new Response(response.body, { status: response.status, headers: newHeaders });
-    }
-
     let contentType = newHeaders.get("content-type") || "";
-    let contentLength = Number(newHeaders.get("content-length") || 0);
-
-    // 对于 YouTube 和 Google API 返回的 JSON，无需浪费 CPU 进行 HTML 重写，直接放行提升性能
-    if (contentType.includes("application/json")) {
+    if (["image", "video", "audio", "font", "style", "script"].includes(fetchDest) || 
+        target.pathname.includes("avatar.php") || 
+        target.pathname.includes("captcha") ||
+        target.pathname.includes("videoplayback") ||
+        contentType.includes("video/") ||
+        contentType.includes("audio/") ||
+        contentType.includes("image/") ||
+        contentType.includes("application/json")
+    ) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
+
+    let contentLength = Number(newHeaders.get("content-length") || 0);
 
     if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) {
         return rewriteHTML(response, newHeaders, url, target);
@@ -103,7 +108,7 @@ async function handleRequest(request, env) {
 function sanitizeHeaders(headers, request) {
     ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data", "content-encoding", "content-length"].forEach(h => headers.delete(h));
     headers.set("Access-Control-Allow-Origin", request.headers.get("Origin") || "*");
-    headers.set("Access-Control-Allow-Credentials", "true"); // 允许跨站凭证（Google 登录必备）
+    headers.set("Access-Control-Allow-Credentials", "true");
 }
 
 function rewriteLocation(response, headers, proxy, target) {
@@ -112,7 +117,7 @@ function rewriteLocation(response, headers, proxy, target) {
     try { headers.set("location", proxy.origin + "/" + new URL(loc, target).href); } catch {}
 }
 
-// 【关键修复 2】：强制注入 SameSite=None 和 Secure，保证 Google/YouTube Cookie 不被浏览器拦截
+// 【核心修复 3】：跨站鉴权保全，注入 SameSite=None 防止 Google/YouTube 账号登录失效
 function rewriteCookies(headers, proxy) {
     if (typeof headers.getSetCookie === 'function') {
         const cookies = headers.getSetCookie();
@@ -120,7 +125,6 @@ function rewriteCookies(headers, proxy) {
         headers.delete("set-cookie");
         for (let cookie of cookies) {
             let newCookie = cookie.replace(/domain=[^;]+/gi, "Domain=" + new URL(proxy.origin).hostname).replace(/path=[^;]+/gi, "Path=/");
-            // 解决跨站授权（Google Auth）被 Chrome 屏蔽的问题
             if (!/SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
             if (!/Secure/i.test(newCookie)) newCookie += "; Secure";
             headers.append("set-cookie", newCookie);
@@ -157,7 +161,7 @@ function rewriteHTML(res, headers, proxy, target) {
         .on("img[src], iframe[src], script[src], source[src]", new URLRewriter(proxy, target, "src"))
         .on("img[srcset], source[srcset]", new SrcsetRewriter(proxy, target))
         .on("form[action]", new URLRewriter(proxy, target, "action"))
-        .on("[data-src], [data-url],[data-href], [data-video],[data-aff], [data-poster]", new DataAttributeRewriter(proxy, target))
+        .on("[data-src],[data-url],[data-href], [data-video],[data-aff], [data-poster]", new DataAttributeRewriter(proxy, target))
         .transform(new Response(res.body, { status: res.status, headers }));
 }
 
@@ -231,7 +235,7 @@ Usage: <code>${url.origin}/https://example.com</code></div></body></html>`,
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// 【关键修复 3】：注入脚本强制携带 credentials 凭证给 Fetch API
+// 【核心修复 4】：强行修改浏览器原生 API 行为，强制所有 XHR/Fetch 附带鉴权 Cookie
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
@@ -245,8 +249,8 @@ window.fetch=async(u,opt)=>{
         if(typeof u==="string"||u instanceof URL){let ur=new URL(u.toString(),window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=location.origin+"/"+ur.href;}
         else if(u instanceof Request){let ur=new URL(u.url,window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=new Request(location.origin+"/"+ur.href,u);}
     }catch(e){}
-    // YouTube / Google 需要强制发送 Cookie 凭据
-    if(opt && !opt.credentials) opt.credentials="include";
+    // YouTube / Google 评论登录强依赖 credentials
+    if(opt && typeof opt === 'object' && !opt.credentials) opt.credentials="include";
     else if(!opt) opt={credentials:"include"};
     return _fetch(u,opt);
 };
@@ -256,7 +260,7 @@ XMLHttpRequest.prototype.open=function(m,u,...r){
     if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}
     return _open.call(this,m,u,...r);
 };
-// XHR 强制发送凭证
+// 劫持 XHR 发送环节，强制设置 withCredentials 支持跨站 Cookie
 const _send=XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.send=function(b){
     this.withCredentials=true;
