@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - CF Pages Edition v11)
+// dist/sw.js (UPP Proxy Service Worker - CF Pages Edition v12)
 
-const VERSION = "v1.0.0-PAGES";
+const VERSION = "v1.0.0-2026031420";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 80;
@@ -18,12 +18,6 @@ self.addEventListener("activate", (event) => {
     );
 });
 
-self.addEventListener("message", (event) => {
-    if (event.data?.type === "PURGE_CACHE") {
-        caches.delete(DYNAMIC_CACHE).then(() => event.ports[0]?.postMessage({ status: "ok" }));
-    }
-});
-
 function isProxyRequest(url) { return url.pathname.match(/^\/https?:\//i); }
 function getTargetOrigin(url) { try { return new URL(url.pathname.slice(1).replace(/^(https?):\/+/, "$1://")).origin; } catch { return ""; } }
 
@@ -31,20 +25,40 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    if (!isProxyRequest(url)) return;
+    // 【工业级防逃逸修复】拦截通过 JS location.href 等导致的非代理链接跳转
+    if (!isProxyRequest(url)) {
+        if (req.referrer) {
+            try {
+                let refUrl = new URL(req.referrer);
+                if (isProxyRequest(refUrl)) {
+                    // 如果上一页是代理页，说明由于相对路径引发了脱离代理的跳出
+                    let targetBaseOrigin = getTargetOrigin(refUrl);
+                    if (targetBaseOrigin) {
+                        let correctUrl = `${url.origin}/${targetBaseOrigin}${url.pathname}${url.search}${url.hash}`;
+                        // 如果是页面跳转，直接 302 强制拉回代理
+                        if (req.mode === 'navigate') {
+                            return event.respondWith(Response.redirect(correctUrl, 302));
+                        } else {
+                            // API 或资源强行拉回
+                            const fetchOpts = { method: req.method, headers: req.headers, redirect: "manual" };
+                            if (req.body && req.method !== 'GET' && req.method !== 'HEAD') {
+                                fetchOpts.body = req.body;
+                                fetchOpts.duplex = "half";
+                            }
+                            return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+        return; // 交给系统默认处理（比如获取 /sw.js 本身）
+    }
 
-    // 1. POST/PUT 等带 Body 请求接管
     if (req.method !== "GET" && req.method !== "HEAD") return event.respondWith(handleNonGetRequest(req));
-    
-    // 2. 流媒体 Range 零拷贝透传引擎
     if (req.headers.has("range")) return event.respondWith(handleRangeStream(req));
-
-    // 3. HTML 与 Sitemap: 网络优先，保障 SEO 与内容时效性
     if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
         return event.respondWith(handleDocumentRequest(req));
     }
-
-    // 4. 静态资源: SWR 极速缓存
     event.respondWith(handleStaticResource(req));
 });
 
@@ -55,7 +69,7 @@ async function handleNonGetRequest(req) {
         const response = await fetch(req.url, fetchOpts);
         return processRedirectResponse(response, req.url);
     } catch {
-        return new Response(JSON.stringify({ error: "Pass-through Failed" }), { status: 502, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ error: "Pass-through Failed" }), { status: 502 });
     }
 }
 
@@ -88,7 +102,6 @@ async function handleStaticResource(req) {
         }
         return finalRes;
     }).catch(() => null);
-    
     return cachedRes || networkPromise || new Response("Unavailable", { status: 503 });
 }
 
@@ -135,7 +148,6 @@ async function createPartialResponseFromCache(req, fullResponse) {
         const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
         if (match) { start = parseInt(match[1], 10); if (match[2]) end = parseInt(match[2], 10); }
     }
-
     if (start >= totalSize || start > end) return new Response("", { status: 416, headers: { "Content-Range": `bytes */${totalSize}` } });
     end = Math.min(end, totalSize - 1);
     const slicedBlob = blob.slice(start, end + 1, contentType);
