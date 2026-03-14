@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v17)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v16)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -24,11 +24,13 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
 
+    // 【跨域预检接管】
     if (request.method === "OPTIONS") {
+        let origin = request.headers.get("Origin");
         return new Response(null, {
             status: 204,
             headers: {
-                "Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
+                "Access-Control-Allow-Origin": origin || "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
                 "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
                 "Access-Control-Max-Age": "86400",
@@ -40,26 +42,22 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
-    // 【Typecho 死循环克星】：精确计算上一页 URL
-    let finalReferer = target.origin + "/"; 
+    // 【解决 Typecho 鉴权与 YouTube 媒体服务器防盗链】
+    let trueOrigin = target.origin;
     const clientReferer = request.headers.get("Referer");
     if (clientReferer) {
         try {
             const parsedClientRef = new URL(clientReferer);
             let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
-            if (refPath.startsWith("http")) finalReferer = refPath;
-        } catch {}
-    }
+            if (refPath.startsWith("http")) {
+                headers.set("Referer", refPath);
+                trueOrigin = new URL(refPath).origin;
+            } else { headers.set("Referer", target.href); }
+        } catch { headers.set("Referer", target.href); }
+    } else { headers.set("Referer", target.href); }
+    headers.set("Origin", trueOrigin);
     
-    // 【核心破局点】：如果发现上一页 (Referer) 和当前动作 (如 /action/logout) 是同一个接口，
-    // 强制把 Referer 指向首页！彻底击碎 Typecho goBack() 导致的无限重定向回音壁！
-    if (finalReferer.split("?")[0] === target.href.split("?")[0]) {
-        finalReferer = target.origin + "/";
-    }
-    
-    headers.set("Referer", finalReferer);
-    headers.set("Origin", new URL(finalReferer).origin);
-    
+    // 伪装代理层
     headers.set("X-Forwarded-Host", target.host);
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
@@ -75,12 +73,14 @@ async function handleRequest(request, env) {
     
     let contentType = newHeaders.get("content-type") || "";
     let contentLength = Number(newHeaders.get("content-length") || 0);
+    const fetchDest = request.headers.get("sec-fetch-dest");
 
     const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCSS = contentType.includes("text/css");
     const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
     const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
 
+    // 【核心修复】清洗并强行暴露响应头
     sanitizeAndExposeHeaders(newHeaders, request, shouldRewriteBody);
     rewriteLocation(response, newHeaders, url, target);
     rewriteCookies(newHeaders, url);
@@ -89,6 +89,7 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
+    // 遇到视频流 (videoplayback)、API 或图片直接无损返还
     if (!shouldRewriteBody || contentType.includes("application/json") || target.pathname.includes("videoplayback")) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
@@ -101,6 +102,7 @@ async function handleRequest(request, env) {
 }
 
 function sanitizeAndExposeHeaders(headers, request, shouldRewriteBody) {
+    // 抹除隔离头，防止浏览器切断 Web Worker 和媒体流连接
     ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy"].forEach(h => headers.delete(h));
     
     if (shouldRewriteBody) {
@@ -108,6 +110,7 @@ function sanitizeAndExposeHeaders(headers, request, shouldRewriteBody) {
         headers.delete("content-length");
     }
 
+    // 【断流终极杀手锏】：向前端暴漏所有底层 Headers！
     let exposedHeaders =[];
     headers.forEach((v, k) => exposedHeaders.push(k));
     headers.set("Access-Control-Expose-Headers", exposedHeaders.join(", "));
@@ -199,7 +202,7 @@ class SrcsetRewriter {
         let val = el.getAttribute("srcset");
         if (!val) return;
         let out = val.split(",").map(p => {
-            let[url, size] = p.trim().split(/\s+/);
+            let [url, size] = p.trim().split(/\s+/);
             try { return this.proxy.origin + "/" + new URL(url, this.target).href + (size ? " " + size : ""); } catch { return p; }
         }).join(", ");
         el.setAttribute("srcset", out);
@@ -214,6 +217,7 @@ function homepage(url) {
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
+// 【终极前端 Hook 注入】
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
@@ -221,6 +225,7 @@ class InjectSandbox {
 <script>
 window.__UP_TARGET="${this.target.origin}";
 
+// 1. Fetch & XHR (凭证透传)
 const _fetch=window.fetch;
 window.fetch=async(u,opt)=>{
     try{
@@ -240,6 +245,7 @@ XMLHttpRequest.prototype.open=function(m,u,...r){
 const _send=XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.send=function(b){this.withCredentials=true; return _send.call(this,b);};
 
+// 2. Web Worker Hook (防止 YouTube DASH 解析器脱离)
 const _Worker = window.Worker;
 window.Worker = function(url, options) {
     try {
@@ -253,6 +259,7 @@ window.Worker = function(url, options) {
     return new _Worker(url, options);
 };
 
+// 3. SPA 无刷新跳转 Hook (解决侧栏动态渲染链接跳转)
 const _push = history.pushState;
 history.pushState = function(state, title, url) {
     if (url) {
@@ -274,6 +281,7 @@ history.replaceState = function(state, title, url) {
     return _replace.call(this, state, title, url);
 };
 
+// 4. 暴力 DOM 监听器 (兜底 YouTube React/Polymer 异步侧栏链接)
 const observer = new MutationObserver(mutations => {
     mutations.forEach(m => {
         m.addedNodes.forEach(n => {
@@ -299,9 +307,6 @@ const observer = new MutationObserver(mutations => {
     });
 });
 observer.observe(document.documentElement, { childList: true, subtree: true });
-
-const _openWin=window.open;
-window.open=function(u,t,f){if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}return _openWin.call(window,u,t,f);};
 
 if("serviceWorker" in navigator) window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>0));
 </script>`, { html: true });
