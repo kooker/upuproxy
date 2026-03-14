@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Advanced Worker - SEO Edition v11)
+// dist/_worker.js (Cloudflare Pages Advanced Worker - Industrial Ultimate v12)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024; // 15MB
 
@@ -17,29 +17,35 @@ async function handleRequest(request, env) {
     let pathAndQuery = request.url.slice(url.origin.length);
     let clean = pathAndQuery.replace(/^\/+/, "");
 
-    // 1. 根路由与基础 SEO
     if (clean === "") return homepage(url);
-    if (clean === "robots.txt") {
-        return new Response("User-agent: *\nAllow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-    }
+    if (clean === "robots.txt") return new Response("User-agent: *\nAllow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    if (clean === "sw.js" || clean === "favicon.ico") return env.ASSETS.fetch(request);
 
-    // 2. CF Pages 静态资源回退 (兜底，虽然 _routes.json 已经排除了 sw.js)
-    if (clean === "sw.js" || clean === "favicon.ico") {
-        return env.ASSETS.fetch(request);
-    }
-
-    // 3. 目标 URL 解析
     clean = clean.replace(/^(https?):\/+/, "$1://");
     if (!clean.startsWith("http")) return new Response("Not Found", { status: 404 });
 
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
 
-    // 4. 请求头伪装
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
-    headers.set("Referer", target.origin);
     headers.set("Origin", target.origin);
+
+    // 【工业级修复 1】：Typecho Referer 真实来源还原引擎
+    const clientReferer = request.headers.get("Referer");
+    if (clientReferer) {
+        try {
+            const parsedClientRef = new URL(clientReferer);
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "");
+            refPath = refPath.replace(/^(https?):\/+/, "$1://");
+            // 将经过伪装的代理 Referer，翻译成目标网站实际文章的真实 URL，破解防盗链与 Typecho 防注入
+            if (refPath.startsWith("http")) headers.set("Referer", refPath);
+            else headers.set("Referer", target.href);
+        } catch { headers.set("Referer", target.href); }
+    } else {
+        headers.set("Referer", target.href);
+    }
+    
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
     const fetchOpts = { method: request.method, headers, redirect: "manual" };
@@ -50,9 +56,7 @@ async function handleRequest(request, env) {
 
     const response = await fetch(target, fetchOpts);
     const newHeaders = new Headers(response.headers);
-    let contentType = newHeaders.get("content-type") || "";
-    let contentLength = Number(newHeaders.get("content-length") || 0);
-
+    
     sanitizeHeaders(newHeaders);
     rewriteLocation(response, newHeaders, url, target);
     rewriteCookies(newHeaders, url);
@@ -61,15 +65,20 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    // 5. SEO / HTML / CSS 重写引擎
+    // 【工业级修复 2】：Avatar 头像保护引擎 (防止图片被错误当成 HTML 解析而损坏)
+    const fetchDest = request.headers.get("sec-fetch-dest");
+    if (["image", "video", "audio", "font", "style", "script"].includes(fetchDest) || target.pathname.includes("avatar.php") || target.pathname.includes("captcha")) {
+        return new Response(response.body, { status: response.status, headers: newHeaders });
+    }
+
+    let contentType = newHeaders.get("content-type") || "";
+    let contentLength = Number(newHeaders.get("content-length") || 0);
+
     if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) {
         return rewriteHTML(response, newHeaders, url, target);
     }
-    if (contentType.includes("xml") || clean.endsWith(".xml")) {
-        if (contentLength < MAX_REWRITE_SIZE) return rewriteTextResource(response, newHeaders, url, target);
-    }
-    if (contentType.includes("text/plain") && clean.endsWith("robots.txt")) {
-        if (contentLength < MAX_REWRITE_SIZE) return rewriteTextResource(response, newHeaders, url, target);
+    if ((contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt")) && contentLength < MAX_REWRITE_SIZE) {
+        return rewriteTextResource(response, newHeaders, url, target);
     }
     if (contentType.includes("text/css") && contentLength < MAX_REWRITE_SIZE) {
         return rewriteCSSResponse(response, newHeaders, url, target);
@@ -129,6 +138,8 @@ function rewriteHTML(res, headers, proxy, target) {
         .on("img[src], iframe[src], script[src], source[src]", new URLRewriter(proxy, target, "src"))
         .on("img[srcset], source[srcset]", new SrcsetRewriter(proxy, target))
         .on("form[action]", new URLRewriter(proxy, target, "action"))
+        // 【工业级修复 3】：专门针对视频站、播放器的 data-* 自定义属性跳转拦截
+        .on("[data-src], [data-url],[data-href], [data-video], [data-aff], [data-poster]", new DataAttributeRewriter(proxy, target))
         .transform(new Response(res.body, { status: res.status, headers }));
 }
 
@@ -140,6 +151,18 @@ class URLRewriter {
         let val = el.getAttribute(this.attr);
         if (!val || /^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val.trim())) return;
         try { el.setAttribute(this.attr, this.proxy.origin + "/" + new URL(val, this.target).href); } catch {}
+    }
+}
+
+// 解决 data-aff 脱离代理的问题
+class DataAttributeRewriter {
+    constructor(proxy, target) { this.proxy = proxy; this.target = target; }
+    element(el) {['data-src', 'data-url', 'data-href', 'data-video', 'data-aff', 'data-poster'].forEach(attr => {
+            let val = el.getAttribute(attr);
+            if (val && !/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val.trim())) {
+                try { el.setAttribute(attr, this.proxy.origin + "/" + new URL(val, this.target).href); } catch {}
+            }
+        });
     }
 }
 
@@ -197,7 +220,6 @@ class InjectSandbox {
         el.prepend(`
 <script>
 window.__UP_TARGET="${this.target.origin}";
-window.UPP_PROXY={purgeCache:()=>navigator.serviceWorker?.controller?new Promise(r=>{let c=new MessageChannel();c.port1.onmessage=e=>r(e.data);navigator.serviceWorker.controller.postMessage({type:"PURGE_CACHE"},[c.port2])}):Promise.resolve("No SW")};
 
 const _fetch=window.fetch;
 window.fetch=async(u,opt)=>{try{
@@ -208,15 +230,8 @@ window.fetch=async(u,opt)=>{try{
 const _open=XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open=function(m,u,...r){if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}return _open.call(this,m,u,...r);};
 
-const _WS=window.WebSocket;
-window.WebSocket=function(u,p){try{
-    let pur=new URL(u,window.__UP_TARGET);
-    if(pur.protocol==='ws:'||pur.protocol==='wss:'){
-        let tgt=(pur.protocol==='wss:'?'https:':'http:')+"//"+pur.host+pur.pathname+pur.search;
-        let pxy=(location.protocol==='https:'?'wss:':'ws:')+"//"+location.host+"/"+tgt;
-        return p?new _WS(pxy,p):new _WS(pxy);
-    }
-}catch(e){}return p?new _WS(u,p):new _WS(u);};
+const _openWin=window.open;
+window.open=function(u,t,f){if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}return _openWin.call(window,u,t,f);};
 
 if("serviceWorker" in navigator) window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>0));
 </script>`, { html: true });
