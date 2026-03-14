@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - CF Pages Edition v12)
+// dist/sw.js (UPP Proxy Service Worker - Industrial v13 Ultimate)
 
-const VERSION = "v1.0.0-2026031420";
+const VERSION = "v1.0.0-2026031421";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 80;
@@ -25,33 +25,25 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 【工业级防逃逸修复】拦截通过 JS location.href 等导致的非代理链接跳转
+    // 防逃逸：拦截 JS 导致的脱离代理跳转
     if (!isProxyRequest(url)) {
         if (req.referrer) {
             try {
                 let refUrl = new URL(req.referrer);
                 if (isProxyRequest(refUrl)) {
-                    // 如果上一页是代理页，说明由于相对路径引发了脱离代理的跳出
                     let targetBaseOrigin = getTargetOrigin(refUrl);
                     if (targetBaseOrigin) {
                         let correctUrl = `${url.origin}/${targetBaseOrigin}${url.pathname}${url.search}${url.hash}`;
-                        // 如果是页面跳转，直接 302 强制拉回代理
-                        if (req.mode === 'navigate') {
-                            return event.respondWith(Response.redirect(correctUrl, 302));
-                        } else {
-                            // API 或资源强行拉回
-                            const fetchOpts = { method: req.method, headers: req.headers, redirect: "manual" };
-                            if (req.body && req.method !== 'GET' && req.method !== 'HEAD') {
-                                fetchOpts.body = req.body;
-                                fetchOpts.duplex = "half";
-                            }
-                            return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
-                        }
+                        if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
+                        
+                        const fetchOpts = { method: req.method, headers: req.headers, redirect: "manual" };
+                        if (req.body && !["GET", "HEAD"].includes(req.method)) { fetchOpts.body = req.body; fetchOpts.duplex = "half"; }
+                        return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
                     }
                 }
             } catch (e) {}
         }
-        return; // 交给系统默认处理（比如获取 /sw.js 本身）
+        return;
     }
 
     if (req.method !== "GET" && req.method !== "HEAD") return event.respondWith(handleNonGetRequest(req));
@@ -68,9 +60,7 @@ async function handleNonGetRequest(req) {
     try {
         const response = await fetch(req.url, fetchOpts);
         return processRedirectResponse(response, req.url);
-    } catch {
-        return new Response(JSON.stringify({ error: "Pass-through Failed" }), { status: 502 });
-    }
+    } catch { return new Response(JSON.stringify({ error: "Gateway Timeout" }), { status: 504 }); }
 }
 
 async function handleDocumentRequest(req) {
@@ -78,14 +68,10 @@ async function handleDocumentRequest(req) {
         const res = await fetch(req, { redirect: "manual" });
         const finalRes = processRedirectResponse(res, req.url);
         if (finalRes.ok) {
-            const cache = await caches.open(DYNAMIC_CACHE);
-            cache.put(req, finalRes.clone()).catch(()=>{});
-            trimCache();
+            caches.open(DYNAMIC_CACHE).then(c => { c.put(req, finalRes.clone()).catch(()=>{}); trimCache(); });
         }
         return finalRes;
-    } catch {
-        return (await caches.match(req)) || new Response("Proxy Offline", { status: 504 });
-    }
+    } catch { return (await caches.match(req)) || new Response("Proxy Offline", { status: 504 }); }
 }
 
 async function handleStaticResource(req) {
@@ -108,7 +94,6 @@ async function handleStaticResource(req) {
 async function handleRangeStream(req) {
     const cache = await caches.open(DYNAMIC_CACHE);
     const cachedRes = await cache.match(req, { ignoreSearch: false, ignoreVary: true });
-    
     if (cachedRes && cachedRes.status === 200) return createPartialResponseFromCache(req, cachedRes);
 
     try {
@@ -123,12 +108,17 @@ async function handleRangeStream(req) {
     } catch { return new Response("Stream Error", { status: 502 }); }
 }
 
+// 【关键修复】Typecho 无限重定向拦截
 function processRedirectResponse(response, reqUrl) {
     if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         if (location) {
+            const proxyOrigin = new URL(reqUrl).origin;
+            // 如果云端 Worker 已经将其包装成了代理格式，绝对不允许二次嵌套！
+            if (location.startsWith(proxyOrigin + "/http")) {
+                return response;
+            }
             try {
-                const proxyOrigin = new URL(reqUrl).origin;
                 const absoluteLoc = new URL(location, getTargetOrigin(new URL(reqUrl))).href;
                 return new Response(null, { status: response.status, headers: { "Location": `${proxyOrigin}/${absoluteLoc}` } });
             } catch {}
