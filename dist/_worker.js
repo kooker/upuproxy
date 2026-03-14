@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate SPA v15)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v16)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -24,7 +24,7 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
 
-    // 【解决 YouTube 留言/登录 CORS 问题】
+    // 【跨域预检接管】
     if (request.method === "OPTIONS") {
         let origin = request.headers.get("Origin");
         return new Response(null, {
@@ -42,21 +42,24 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
-    // 【解决媒体服务器鉴权拒绝】动态提取真实 Origin 和 Referer
-    const clientReferer = request.headers.get("Referer");
+    // 【解决 Typecho 鉴权与 YouTube 媒体服务器防盗链】
     let trueOrigin = target.origin;
+    const clientReferer = request.headers.get("Referer");
     if (clientReferer) {
         try {
             const parsedClientRef = new URL(clientReferer);
             let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
             if (refPath.startsWith("http")) {
                 headers.set("Referer", refPath);
-                trueOrigin = new URL(refPath).origin; // 骗过媒体服务器，声称我们来自 youtube.com
+                trueOrigin = new URL(refPath).origin;
             } else { headers.set("Referer", target.href); }
         } catch { headers.set("Referer", target.href); }
     } else { headers.set("Referer", target.href); }
     headers.set("Origin", trueOrigin);
     
+    // 伪装代理层
+    headers.set("X-Forwarded-Host", target.host);
+    headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
     const fetchOpts = { method: request.method, headers, redirect: "manual" };
@@ -72,23 +75,22 @@ async function handleRequest(request, env) {
     let contentLength = Number(newHeaders.get("content-length") || 0);
     const fetchDest = request.headers.get("sec-fetch-dest");
 
-    // 判断是否需要进行 Body 重写
     const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCSS = contentType.includes("text/css");
     const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
     const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
 
-    // 【解决视频 1 分钟断流】：分离式清洗头。如果是视频，绝对保留 content-length！
-    sanitizeHeaders(newHeaders, request, shouldRewriteBody);
-    rewriteLocation(response, newHeaders, url, target); // 解决 Typecho 死循环的核心
+    // 【核心修复】清洗并强行暴露响应头
+    sanitizeAndExposeHeaders(newHeaders, request, shouldRewriteBody);
+    rewriteLocation(response, newHeaders, url, target);
     rewriteCookies(newHeaders, url);
 
     if (request.headers.get("Upgrade") === "websocket") {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    // 遇到视频、图片、JSON，直接原样下发管道！
-    if (!shouldRewriteBody) {
+    // 遇到视频流 (videoplayback)、API 或图片直接无损返还
+    if (!shouldRewriteBody || contentType.includes("application/json") || target.pathname.includes("videoplayback")) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
@@ -99,14 +101,19 @@ async function handleRequest(request, env) {
     return new Response(response.body, { status: response.status, headers: newHeaders });
 }
 
-function sanitizeHeaders(headers, request, shouldRewriteBody) {
-    ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data"].forEach(h => headers.delete(h));
+function sanitizeAndExposeHeaders(headers, request, shouldRewriteBody) {
+    // 抹除隔离头，防止浏览器切断 Web Worker 和媒体流连接
+    ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy"].forEach(h => headers.delete(h));
     
-    // 如果修改了内容，才删除长度和压缩标示；否则保留（对流媒体至关重要）
     if (shouldRewriteBody) {
         headers.delete("content-encoding");
         headers.delete("content-length");
     }
+
+    // 【断流终极杀手锏】：向前端暴漏所有底层 Headers！
+    let exposedHeaders =[];
+    headers.forEach((v, k) => exposedHeaders.push(k));
+    headers.set("Access-Control-Expose-Headers", exposedHeaders.join(", "));
 
     let origin = request.headers.get("Origin");
     headers.set("Access-Control-Allow-Origin", origin || "*");
@@ -118,10 +125,7 @@ function rewriteLocation(response, headers, proxy, target) {
     if (!loc) return;
     try {
         let absoluteLoc = new URL(loc, target).href;
-        // 如果源站返回的已经是我们的代理格式，不要再嵌套（防死循环终极保险）
-        if (!absoluteLoc.startsWith(proxy.origin)) {
-            headers.set("location", proxy.origin + "/" + absoluteLoc);
-        }
+        if (!absoluteLoc.startsWith(proxy.origin)) headers.set("location", proxy.origin + "/" + absoluteLoc);
     } catch {}
 }
 
@@ -213,7 +217,7 @@ function homepage(url) {
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// 【解决 YouTube 侧栏 SPA 动态路由加载脱离问题的终极杀器】
+// 【终极前端 Hook 注入】
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
@@ -221,7 +225,7 @@ class InjectSandbox {
 <script>
 window.__UP_TARGET="${this.target.origin}";
 
-// 1. Fetch 与 XHR 拦截 (防 API 逃脱，保证 Credentials)
+// 1. Fetch & XHR (凭证透传)
 const _fetch=window.fetch;
 window.fetch=async(u,opt)=>{
     try{
@@ -241,7 +245,21 @@ XMLHttpRequest.prototype.open=function(m,u,...r){
 const _send=XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.send=function(b){this.withCredentials=true; return _send.call(this,b);};
 
-// 2. 拦截 History API (修复 YouTube SPA 单页跳转防逃脱)
+// 2. Web Worker Hook (防止 YouTube DASH 解析器脱离)
+const _Worker = window.Worker;
+window.Worker = function(url, options) {
+    try {
+        if (typeof url === 'string') {
+            let p = new URL(url, window.__UP_TARGET);
+            if (p.protocol.startsWith('http') && !p.href.startsWith(location.origin)) {
+                url = location.origin + "/" + p.href;
+            }
+        }
+    } catch(e) {}
+    return new _Worker(url, options);
+};
+
+// 3. SPA 无刷新跳转 Hook (解决侧栏动态渲染链接跳转)
 const _push = history.pushState;
 history.pushState = function(state, title, url) {
     if (url) {
@@ -263,13 +281,12 @@ history.replaceState = function(state, title, url) {
     return _replace.call(this, state, title, url);
 };
 
-// 3. DOM 动态嗅探器 (修复 YouTube 侧栏 JS 延迟渲染导致节点无法被 Worker 重写的致命 Bug)
+// 4. 暴力 DOM 监听器 (兜底 YouTube React/Polymer 异步侧栏链接)
 const observer = new MutationObserver(mutations => {
     mutations.forEach(m => {
         m.addedNodes.forEach(n => {
-            if (n.nodeType === 1) { // 如果是元素节点
-                const fixAttr = (node) => {
-                    ['href', 'src', 'action'].forEach(attr => {
+            if (n.nodeType === 1) { 
+                const fixAttr = (node) => {['href', 'src', 'action'].forEach(attr => {
                         if (node.hasAttribute && node.hasAttribute(attr)) {
                             let val = node.getAttribute(attr);
                             if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(location.origin)) {
@@ -284,17 +301,12 @@ const observer = new MutationObserver(mutations => {
                     });
                 };
                 fixAttr(n);
-                if (n.querySelectorAll) {
-                    n.querySelectorAll('[href], [src],[action]').forEach(fixAttr);
-                }
+                if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
             }
         });
     });
 });
 observer.observe(document.documentElement, { childList: true, subtree: true });
-
-const _openWin=window.open;
-window.open=function(u,t,f){if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}return _openWin.call(window,u,t,f);};
 
 if("serviceWorker" in navigator) window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>0));
 </script>`, { html: true });
