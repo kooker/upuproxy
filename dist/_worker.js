@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v19)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v20)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -27,13 +27,13 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL format", { status: 400 }); }
 
-    // 【1. 优雅阻截 Cloudflare 1003 报错】
+    // 【规避 1003 物理拦截】拦截 Cloudflare 核心网络物理层不支持的端口
     if (target.port) {
         const portNum = Number(target.port);
         const CF_SUPPORTED_PORTS =[80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096];
         if (!CF_SUPPORTED_PORTS.includes(portNum)) {
             return new Response(
-                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port [${portNum}].\nThis is a Cloudflare physical network limit, not a proxy bug.\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
+                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nThis is a Cloudflare physical network limit, not a proxy bug.\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
                 { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" } }
             );
         }
@@ -54,10 +54,9 @@ async function handleRequest(request, env) {
     }
 
     const headers = new Headers(request.headers);
-    headers.set("Host", target.host);
 
-    // 【核心修复二】强行伪装来源：YouTube 极其严苛的心跳 API 校验防御
     let trueOrigin = target.origin;
+    // 针对 YouTube 严苛的防盗链与心跳 API 进行伪装
     if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
         headers.set("Origin", "https://www.youtube.com");
         headers.set("Referer", "https://www.youtube.com/");
@@ -78,13 +77,7 @@ async function handleRequest(request, env) {
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
-    // 【核心修复三】强制穿透 CF Edge Cache：避免 YouTube 取到过期切片导致播放器 51 秒宕机
-    const fetchOpts = { 
-        method: request.method, 
-        headers, 
-        redirect: "manual",
-        cf: { cacheTtl: 0, cacheEverything: false } 
-    };
+    const fetchOpts = { method: request.method, headers, redirect: "manual" };
     if (!["GET", "HEAD"].includes(request.method) && request.body) {
         fetchOpts.body = request.body; fetchOpts.duplex = "half"; 
     }
@@ -109,6 +102,7 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
+    // 【核心修复】强制穿透 CF Edge Cache，赋予正确的跨域凭证，绝不缓存视频分片
     if (target.pathname.includes("videoplayback") || clean.includes("live=1") || clean.includes("m3u8")) {
         newHeaders.set('Cache-Control', 'no-store, no-cache, no-transform, must-revalidate');
         return new Response(response.body, { status: response.status, headers: newHeaders });
@@ -176,7 +170,7 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
     return new Response(css, { status: res.status, headers });
 }
 
-// 补充 WebWorker 环境防失联注入
+// 【Web Worker 无损挂载】：只解决 Worker 内置 51 秒断流，同时确保 Request 解析 100% 健壮
 async function rewriteJSResponse(res, headers, proxy, target) {
     let js = await res.text();
     const hookCode = `
@@ -197,13 +191,25 @@ async function rewriteJSResponse(res, headers, proxy, target) {
             try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
         }
         const _fetch = self.fetch;
-        self.fetch = async (u, opt) => {
+        self.fetch = async function(resource, options) {
             try { 
-                if (u instanceof Request) { u = new Request(toProxyUrl(u.url), u); }
-                else { u = toProxyUrl(u); }
+                if (typeof resource === 'string' || resource instanceof URL) {
+                    resource = toProxyUrl(resource);
+                } else if (resource instanceof Request) {
+                    const newUrl = toProxyUrl(resource.url);
+                    const overrideOpts = {
+                        method: resource.method, headers: resource.headers,
+                        mode: resource.mode === 'navigate' ? 'cors' : resource.mode,
+                        credentials: 'include', cache: resource.cache, redirect: resource.redirect
+                    };
+                    if (resource.method !== 'GET' && resource.method !== 'HEAD') {
+                        try { overrideOpts.body = await resource.clone().blob(); } catch(e) {}
+                    }
+                    resource = new Request(newUrl, overrideOpts);
+                }
             } catch(e) {}
-            if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
-            return _fetch(u, opt);
+            if (options) { options.credentials = "include"; } else { options = { credentials: "include" }; }
+            return _fetch(resource, options);
         };
         const _open = self.XMLHttpRequest.prototype.open;
         self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
@@ -272,7 +278,7 @@ function homepage(url) {
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// 【终极 Hook Sandbox】：拦截 sendBeacon，防止心跳探测断开
+// 【终极纯净 Sandbox】: 取消主页面的 fetch/XHR 破坏性挂载，交由 Service Worker 自动管理
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
@@ -295,32 +301,7 @@ class InjectSandbox {
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
-    const _fetch = window.fetch;
-    window.fetch = async (u, opt) => {
-        try { 
-            if (u instanceof Request) { u = new Request(toProxyUrl(u.url), u); } 
-            else { u = toProxyUrl(u); }
-        } catch(e) {}
-        if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
-        return _fetch(u, opt);
-    };
-
-    const _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(m, u, ...r) {
-        try { u = toProxyUrl(u); } catch(e) {} return _open.call(this, m, u, ...r);
-    };
-    const _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
-
-    // YouTube 关键修复：心跳拦截 (防 51 秒切断的核心防御)
-    const _sendBeacon = navigator.sendBeacon;
-    if (_sendBeacon) {
-        navigator.sendBeacon = function(url, data) {
-            try { url = toProxyUrl(url); } catch(e) {}
-            return _sendBeacon.call(this, url, data);
-        };
-    }
-
+    // 仅针对 ServiceWorker 无法接管的 WebSocket 进行 Hook
     const _WebSocket = window.WebSocket;
     if (_WebSocket) {
         window.WebSocket = function(url, protocols) {
@@ -335,6 +316,7 @@ class InjectSandbox {
         };
     }
 
+    // 修复无刷新框架的 URL 突变
     const _push = history.pushState;
     history.pushState = function(state, title, url) {
         if (url) { try { url = toProxyUrl(url); } catch(e){} } return _push.call(this, state, title, url);
@@ -344,6 +326,7 @@ class InjectSandbox {
         if (url) { try { url = toProxyUrl(url); } catch(e){} } return _replace.call(this, state, title, url);
     };
 
+    // 兜底 DOM 动态生成渲染
     const observer = new MutationObserver(mutations => {
         mutations.forEach(m => {
             m.addedNodes.forEach(n => {
