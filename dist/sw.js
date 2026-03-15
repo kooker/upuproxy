@@ -1,10 +1,10 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v17)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Ultimate v18)
 
-const VERSION = "v1.0.0-202603152203";
+const VERSION = "v1.0.0-202603152244";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
-const MAX_DYNAMIC_ITEMS = 80;
-const MAX_CACHE_SIZE_MB = 50; 
+const MAX_DYNAMIC_ITEMS = 120;
+const MAX_CACHE_SIZE_MB = 100; 
 
 self.addEventListener("install", (event) => self.skipWaiting());
 self.addEventListener("activate", (event) => {
@@ -18,12 +18,10 @@ self.addEventListener("activate", (event) => {
     );
 });
 
-// 强化版正则：完美兼容带端口号、带IP的复杂代理URL格式
 function isProxyRequest(url) { 
     return url.pathname.match(/^\/https?:\/\//i); 
 }
 
-// 提取真实目标 Origin，健壮性提升
 function getTargetOrigin(url) { 
     try { 
         let clean = url.pathname.slice(1).replace(/^(https?):\/+/, "$1://");
@@ -32,7 +30,7 @@ function getTargetOrigin(url) {
     } catch { return ""; } 
 }
 
-// 通过 Referrer 找回丢失的 Target Origin（拯救脱离 Hook 的 SPA 相对路径请求）
+// 找回被降级处理的单页应用 SPA / Web Worker 脱逃源点
 function getTargetOriginFromReferrer(request) {
     try {
         const ref = request.referrer;
@@ -47,70 +45,57 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 1. 本地静态资源放行
+    // 1. 本地框架资源白名单
     if (url.origin === self.location.origin && !isProxyRequest(url)) {
         const p = url.pathname;
-        if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) {
-            return; 
-        }
+        if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return; 
         
-        // 【关键修复】拦截前端框架（如 GitHub / React）发起的未被 Hook 捕获的相对路径 API
+        // 拦截 SPA 或 Web Worker 遗漏的隐藏 API 相对路径
         const targetOrigin = getTargetOriginFromReferrer(req);
         if (targetOrigin) {
             const correctUrl = `${self.location.origin}/${targetOrigin}${url.pathname}${url.search}`;
-            if (req.mode === 'navigate') {
-                return event.respondWith(Response.redirect(correctUrl, 302));
-            }
+            if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
             const fetchOpts = {
-                method: req.method,
-                headers: req.headers,
-                redirect: "manual",
+                method: req.method, headers: req.headers, redirect: "manual",
                 mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
                 credentials: req.credentials
             };
             if (req.body && !['GET', 'HEAD'].includes(req.method)) {
-                fetchOpts.body = req.body;
-                fetchOpts.duplex = 'half';
+                fetchOpts.body = req.body; fetchOpts.duplex = 'half';
             }
             return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
         }
         return; 
     }
 
-    // 2. 【终极逃逸捕获网】拦截 Web Worker、JS 相对路径、隐藏 API 发起的脱离代理请求
+    // 2. 第三方跨域逃逸黑洞捕获 (核心兜底)
     if (!isProxyRequest(url) && url.origin !== self.location.origin) {
         let correctUrl = `${self.location.origin}/${url.href}`;
-        if (req.mode === 'navigate') {
-            return event.respondWith(Response.redirect(correctUrl, 302));
-        }
+        if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
+        
         const fetchOpts = {
-            method: req.method,
-            headers: req.headers,
-            redirect: "manual",
-            mode: req.mode === 'navigate' ? 'cors' : req.mode,
+            method: req.method, headers: req.headers, redirect: "manual",
+            mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
             credentials: req.credentials
         };
-        if (req.body && req.method !== 'GET' && req.method !== 'HEAD') {
-            fetchOpts.body = req.body;
-            fetchOpts.duplex = 'half';
+        if (req.body && !['GET', 'HEAD'].includes(req.method)) {
+            fetchOpts.body = req.body; fetchOpts.duplex = 'half';
         }
         return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
     }
 
-    // 3. 媒体流与非 GET 请求，纯管道直通
+    // 3. 媒体流/直播流直通隧道 (防止 CF Edge 断连)
     if (req.method !== "GET" && req.method !== "HEAD") {
         return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
     }
-    if (req.headers.has("range") || url.pathname.includes("videoplayback")) {
+    if (req.headers.has("range") || url.pathname.includes("videoplayback") || url.pathname.includes("live=1")) {
         return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
     }
 
-    // 4. HTML 与 XML：网络优先
+    // 4. 文档优先及静态极速缓存
     if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
         return event.respondWith(handleDocumentRequest(req));
     }
-
-    // 5. 静态资源：极速缓存
     event.respondWith(handleStaticResource(req));
 });
 
@@ -134,13 +119,9 @@ async function handleDocumentRequest(req) {
     try {
         const res = await fetch(req);
         const processed = processRedirectResponse(res, req.url);
-        if (processed.ok) {
-            caches.open(DYNAMIC_CACHE).then(c => { c.put(req, processed.clone()).catch(()=>{}); trimCache(); });
-        }
+        if (processed.ok) { caches.open(DYNAMIC_CACHE).then(c => { c.put(req, processed.clone()).catch(()=>{}); trimCache(); }); }
         return processed;
-    } catch { 
-        return (await caches.match(req)) || new Response("Proxy Offline", { status: 504 }); 
-    }
+    } catch { return (await caches.match(req)) || new Response("Proxy Offline", { status: 504 }); }
 }
 
 async function handleStaticResource(req) {
@@ -151,8 +132,7 @@ async function handleStaticResource(req) {
         if (processed.ok && processed.status === 200) {
             const size = Number(processed.headers.get("content-length") || 0);
             if (size > 0 && size < MAX_CACHE_SIZE_MB * 1024 * 1024) {
-                cache.put(req, processed.clone()).catch(()=>{});
-                trimCache();
+                cache.put(req, processed.clone()).catch(()=>{}); trimCache();
             }
         }
         return processed;
