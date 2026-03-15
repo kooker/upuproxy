@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v16)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v17)
 
-const VERSION = "v1.0.0-202603142241";
+const VERSION = "v1.0.0-202603152203";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 80;
@@ -18,16 +18,63 @@ self.addEventListener("activate", (event) => {
     );
 });
 
-function isProxyRequest(url) { return url.pathname.match(/^\/https?:\//i); }
-function getTargetOrigin(url) { try { return new URL(url.pathname.slice(1).replace(/^(https?):\/+/, "$1://")).origin; } catch { return ""; } }
+// 强化版正则：完美兼容带端口号、带IP的复杂代理URL格式
+function isProxyRequest(url) { 
+    return url.pathname.match(/^\/https?:\/\//i); 
+}
+
+// 提取真实目标 Origin，健壮性提升
+function getTargetOrigin(url) { 
+    try { 
+        let clean = url.pathname.slice(1).replace(/^(https?):\/+/, "$1://");
+        if (!clean.startsWith("http")) clean = "https://" + clean;
+        return new URL(clean).origin; 
+    } catch { return ""; } 
+}
+
+// 通过 Referrer 找回丢失的 Target Origin（拯救脱离 Hook 的 SPA 相对路径请求）
+function getTargetOriginFromReferrer(request) {
+    try {
+        const ref = request.referrer;
+        if (!ref) return null;
+        const refUrl = new URL(ref);
+        if (isProxyRequest(refUrl)) return getTargetOrigin(refUrl);
+    } catch (e) {}
+    return null;
+}
 
 self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 1. 本地静态资源放行 (如 /sw.js)
+    // 1. 本地静态资源放行
     if (url.origin === self.location.origin && !isProxyRequest(url)) {
-        return;
+        const p = url.pathname;
+        if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) {
+            return; 
+        }
+        
+        // 【关键修复】拦截前端框架（如 GitHub / React）发起的未被 Hook 捕获的相对路径 API
+        const targetOrigin = getTargetOriginFromReferrer(req);
+        if (targetOrigin) {
+            const correctUrl = `${self.location.origin}/${targetOrigin}${url.pathname}${url.search}`;
+            if (req.mode === 'navigate') {
+                return event.respondWith(Response.redirect(correctUrl, 302));
+            }
+            const fetchOpts = {
+                method: req.method,
+                headers: req.headers,
+                redirect: "manual",
+                mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
+                credentials: req.credentials
+            };
+            if (req.body && !['GET', 'HEAD'].includes(req.method)) {
+                fetchOpts.body = req.body;
+                fetchOpts.duplex = 'half';
+            }
+            return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
+        }
+        return; 
     }
 
     // 2. 【终极逃逸捕获网】拦截 Web Worker、JS 相对路径、隐藏 API 发起的脱离代理请求
@@ -50,7 +97,7 @@ self.addEventListener("fetch", (event) => {
         return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
     }
 
-    // 3. 媒体流与非 GET 请求，绝对不拆包，纯管道直通！
+    // 3. 媒体流与非 GET 请求，纯管道直通
     if (req.method !== "GET" && req.method !== "HEAD") {
         return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
     }
@@ -67,18 +114,15 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(handleStaticResource(req));
 });
 
-// 处理重定向死循环：确保 302/301 跳转被正确控制在代理域内
 function processRedirectResponse(response, reqUrl) {
     if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         if (location) {
             const proxyOrigin = new URL(reqUrl).origin;
-            // 如果后端返回的 Location 已经是代理地址，直接返回防止无限嵌套
-            if (location.startsWith(proxyOrigin + "/http")) {
-                return response;
-            }
+            if (location.startsWith(proxyOrigin + "/http")) return response;
             try {
-                const absoluteLoc = new URL(location, getTargetOrigin(new URL(reqUrl))).href;
+                const targetOrigin = getTargetOrigin(new URL(reqUrl));
+                const absoluteLoc = new URL(location, targetOrigin).href;
                 return new Response(null, { status: response.status, headers: { "Location": `${proxyOrigin}/${absoluteLoc}` } });
             } catch {}
         }
