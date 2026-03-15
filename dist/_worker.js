@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v16)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v17)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -18,11 +18,18 @@ async function handleRequest(request, env) {
     if (clean === "robots.txt") return new Response("User-agent: *\nAllow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     if (clean === "sw.js" || clean === "favicon.ico") return env.ASSETS.fetch(request);
 
+    // 【端口号与协议修复】智能判断含端口号 URL，并自动补全缺少协议的代理格式
     clean = clean.replace(/^(https?):\/+/, "$1://");
-    if (!clean.startsWith("http")) return new Response("Not Found", { status: 404 });
+    if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+        if (clean.match(/^([a-zA-Z0-9.-]+)(:\d+)?(\/.*)?$/)) {
+            clean = "https://" + clean;
+        } else {
+            return new Response("Invalid Target URL", { status: 400 });
+        }
+    }
 
     let target;
-    try { target = new URL(clean); } catch { return new Response("Invalid Target URL", { status: 400 }); }
+    try { target = new URL(clean); } catch { return new Response("Invalid Target URL format", { status: 400 }); }
 
     // 【跨域预检接管】
     if (request.method === "OPTIONS") {
@@ -40,9 +47,8 @@ async function handleRequest(request, env) {
     }
 
     const headers = new Headers(request.headers);
-    headers.set("Host", target.host);
+    headers.set("Host", target.host); // 完美支持目标服务器自带端口解析
 
-    // 【解决 Typecho 鉴权与 YouTube 媒体服务器防盗链】
     let trueOrigin = target.origin;
     const clientReferer = request.headers.get("Referer");
     if (clientReferer) {
@@ -57,7 +63,6 @@ async function handleRequest(request, env) {
     } else { headers.set("Referer", target.href); }
     headers.set("Origin", trueOrigin);
     
-    // 伪装代理层
     headers.set("X-Forwarded-Host", target.host);
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
     ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
@@ -73,14 +78,12 @@ async function handleRequest(request, env) {
     
     let contentType = newHeaders.get("content-type") || "";
     let contentLength = Number(newHeaders.get("content-length") || 0);
-    const fetchDest = request.headers.get("sec-fetch-dest");
 
     const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCSS = contentType.includes("text/css");
     const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
     const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
 
-    // 【核心修复】清洗并强行暴露响应头
     sanitizeAndExposeHeaders(newHeaders, request, shouldRewriteBody);
     rewriteLocation(response, newHeaders, url, target);
     rewriteCookies(newHeaders, url);
@@ -89,7 +92,6 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    // 遇到视频流 (videoplayback)、API 或图片直接无损返还
     if (!shouldRewriteBody || contentType.includes("application/json") || target.pathname.includes("videoplayback")) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
@@ -102,19 +104,14 @@ async function handleRequest(request, env) {
 }
 
 function sanitizeAndExposeHeaders(headers, request, shouldRewriteBody) {
-    // 抹除隔离头，防止浏览器切断 Web Worker 和媒体流连接
     ;["content-security-policy", "content-security-policy-report-only", "x-frame-options", "clear-site-data", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy"].forEach(h => headers.delete(h));
-    
     if (shouldRewriteBody) {
         headers.delete("content-encoding");
         headers.delete("content-length");
     }
-
-    // 【断流终极杀手锏】：向前端暴漏所有底层 Headers！
     let exposedHeaders =[];
     headers.forEach((v, k) => exposedHeaders.push(k));
     headers.set("Access-Control-Expose-Headers", exposedHeaders.join(", "));
-
     let origin = request.headers.get("Origin");
     headers.set("Access-Control-Allow-Origin", origin || "*");
     if (origin) headers.set("Access-Control-Allow-Credentials", "true");
@@ -155,6 +152,7 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
     css = css.replace(/url\((.*?)\)/gi, (m, p) => {
         let u = p.replace(/['"]/g, "").trim();
         if (/^(data:|blob:|#)/i.test(u)) return m;
+        if (u.startsWith(proxy.origin + '/http')) return m; // 拦截双重代理
         try { return `url('${proxy.origin}/${new URL(u, target).href}')`; } catch { return m; }
     });
     return new Response(css, { status: res.status, headers });
@@ -181,6 +179,7 @@ class URLRewriter {
     element(el) {
         let val = el.getAttribute(this.attr);
         if (!val || /^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val.trim())) return;
+        if (val.startsWith(this.proxy.origin + '/http')) return; // 防止节点渲染期间二次污染
         try { el.setAttribute(this.attr, this.proxy.origin + "/" + new URL(val, this.target).href); } catch {}
     }
 }
@@ -189,7 +188,7 @@ class DataAttributeRewriter {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {['data-src', 'data-url', 'data-href', 'data-video', 'data-aff', 'data-poster'].forEach(attr => {
             let val = el.getAttribute(attr);
-            if (val && !/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val.trim())) {
+            if (val && !/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val.trim()) && !val.startsWith(this.proxy.origin + '/http')) {
                 try { el.setAttribute(attr, this.proxy.origin + "/" + new URL(val, this.target).href); } catch {}
             }
         });
@@ -203,6 +202,7 @@ class SrcsetRewriter {
         if (!val) return;
         let out = val.split(",").map(p => {
             let [url, size] = p.trim().split(/\s+/);
+            if(url.startsWith(this.proxy.origin + '/http')) return p;
             try { return this.proxy.origin + "/" + new URL(url, this.target).href + (size ? " " + size : ""); } catch { return p; }
         }).join(", ");
         el.setAttribute("srcset", out);
@@ -217,98 +217,108 @@ function homepage(url) {
     { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// 【终极前端 Hook 注入】
+// 【终极前端 Hook 注入：完美解决 SPA 框架渲染及历史路由崩溃】
 class InjectSandbox {
     constructor(proxy, target) { this.proxy = proxy; this.target = target; }
     element(el) {
         el.prepend(`
 <script>
-window.__UP_TARGET="${this.target.origin}";
+(function() {
+    const __ProxyOrigin = "${this.proxy.origin}";
+    const __TargetOrigin = "${this.target.origin}";
+    window.__UP_TARGET = __TargetOrigin;
 
-// 1. Fetch & XHR (凭证透传)
-const _fetch=window.fetch;
-window.fetch=async(u,opt)=>{
-    try{
-        if(typeof u==="string"||u instanceof URL){let ur=new URL(u.toString(),window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=location.origin+"/"+ur.href;}
-        else if(u instanceof Request){let ur=new URL(u.url,window.__UP_TARGET);if(ur.protocol.startsWith('http'))u=new Request(location.origin+"/"+ur.href,u);}
-    }catch(e){}
-    if(opt && typeof opt === 'object' && !opt.credentials) opt.credentials="include";
-    else if(!opt) opt={credentials:"include"};
-    return _fetch(u,opt);
-};
-
-const _open=XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open=function(m,u,...r){
-    if(typeof u==="string"){try{let p=new URL(u,window.__UP_TARGET);if(p.protocol.startsWith('http'))u=location.origin+"/"+p.href;}catch(e){}}
-    return _open.call(this,m,u,...r);
-};
-const _send=XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.send=function(b){this.withCredentials=true; return _send.call(this,b);};
-
-// 2. Web Worker Hook (防止 YouTube DASH 解析器脱离)
-const _Worker = window.Worker;
-window.Worker = function(url, options) {
-    try {
-        if (typeof url === 'string') {
-            let p = new URL(url, window.__UP_TARGET);
-            if (p.protocol.startsWith('http') && !p.href.startsWith(location.origin)) {
-                url = location.origin + "/" + p.href;
+    // 智能 URL 转换引擎：防止 SPA 原生请求路径被浏览器误强行补全为代理根域而导致的 404
+    function toProxyUrl(urlStr) {
+        if (!urlStr) return urlStr;
+        let str = urlStr.toString();
+        
+        // 1. 已经套上代理的直接放行
+        if (str.startsWith(__ProxyOrigin + '/http')) return str;
+        
+        // 2. 被浏览器绝对化解析的 SPA 相对 API 请求修复 (例如 /api/v1 => proxy.com/api/v1)
+        if (str.startsWith(__ProxyOrigin + '/')) {
+            let path = str.slice(__ProxyOrigin.length);
+            if (!path.startsWith('/http')) {
+                try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){}
+            } else {
+                return str;
             }
         }
-    } catch(e) {}
-    return new _Worker(url, options);
-};
-
-// 3. SPA 无刷新跳转 Hook (解决侧栏动态渲染链接跳转)
-const _push = history.pushState;
-history.pushState = function(state, title, url) {
-    if (url) {
-        try {
-            let p = new URL(url, window.__UP_TARGET);
-            if (p.protocol.startsWith('http')) url = location.origin + "/" + p.href;
-        } catch(e){}
+        
+        // 3. 常规路径挂载代理
+        try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
-    return _push.call(this, state, title, url);
-};
-const _replace = history.replaceState;
-history.replaceState = function(state, title, url) {
-    if (url) {
-        try {
-            let p = new URL(url, window.__UP_TARGET);
-            if (p.protocol.startsWith('http')) url = location.origin + "/" + p.href;
-        } catch(e){}
-    }
-    return _replace.call(this, state, title, url);
-};
 
-// 4. 暴力 DOM 监听器 (兜底 YouTube React/Polymer 异步侧栏链接)
-const observer = new MutationObserver(mutations => {
-    mutations.forEach(m => {
-        m.addedNodes.forEach(n => {
-            if (n.nodeType === 1) { 
-                const fixAttr = (node) => {['href', 'src', 'action'].forEach(attr => {
-                        if (node.hasAttribute && node.hasAttribute(attr)) {
-                            let val = node.getAttribute(attr);
-                            if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(location.origin)) {
-                                try {
-                                    let abs = new URL(val, window.__UP_TARGET);
-                                    if (abs.protocol.startsWith('http')) {
-                                        node.setAttribute(attr, location.origin + "/" + abs.href);
-                                    }
-                                } catch(e){}
-                            }
-                        }
-                    });
-                };
-                fixAttr(n);
-                if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
+    // 1. 彻底封锁 Fetch & XHR 越权
+    const _fetch = window.fetch;
+    window.fetch = async (u, opt) => {
+        try {
+            if (u instanceof Request) {
+                u = new Request(toProxyUrl(u.url), u);
+            } else {
+                u = toProxyUrl(u);
             }
+        } catch(e) {}
+        if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include";
+        else if (!opt) opt = { credentials: "include" };
+        return _fetch(u, opt);
+    };
+
+    const _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(m, u, ...r) {
+        try { u = toProxyUrl(u); } catch(e) {}
+        return _open.call(this, m, u, ...r);
+    };
+    const _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
+
+    // 2. Web Worker Hook
+    const _Worker = window.Worker;
+    window.Worker = function(url, options) {
+        try { url = toProxyUrl(url); } catch(e) {}
+        return new _Worker(url, options);
+    };
+
+    // 3. SPA 无刷新跳转 Hook (解决框架侧栏动态渲染链接跳转)
+    const _push = history.pushState;
+    history.pushState = function(state, title, url) {
+        if (url) { try { url = toProxyUrl(url); } catch(e){} }
+        return _push.call(this, state, title, url);
+    };
+    const _replace = history.replaceState;
+    history.replaceState = function(state, title, url) {
+        if (url) { try { url = toProxyUrl(url); } catch(e){} }
+        return _replace.call(this, state, title, url);
+    };
+
+    // 4. 暴力 DOM 监听器 (兜底 React/Vue 异步渲染出的原始链接)
+    const observer = new MutationObserver(mutations => {
+        mutations.forEach(m => {
+            m.addedNodes.forEach(n => {
+                if (n.nodeType === 1) { 
+                    const fixAttr = (node) => {
+                        ['href', 'src', 'action'].forEach(attr => {
+                            if (node.hasAttribute && node.hasAttribute(attr)) {
+                                let val = node.getAttribute(attr);
+                                if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
+                                    try { node.setAttribute(attr, toProxyUrl(val)); } catch(e){}
+                                }
+                            }
+                        });
+                    };
+                    fixAttr(n);
+                    if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
+                }
+            });
         });
     });
-});
-observer.observe(document.documentElement, { childList: true, subtree: true });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
 
-if("serviceWorker" in navigator) window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>0));
+    if("serviceWorker" in navigator) {
+        window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0));
+    }
+})();
 </script>`, { html: true });
     }
 }
