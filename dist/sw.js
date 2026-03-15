@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Ultimate v19)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v20)
 
-const VERSION = "v1.0.0-202603152304";
+const VERSION = "v1.0.0-202603152317";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 120;
@@ -26,6 +26,7 @@ function getTargetOrigin(url) {
         return new URL(clean).origin; 
     } catch { return ""; } 
 }
+
 function getTargetOriginFromReferrer(request) {
     try {
         const ref = request.referrer;
@@ -40,12 +41,7 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 【核心修复一】绝对旁路：媒体流、直播分片、Range 请求绝对不允许被 SW 拦截！
-    // 交由浏览器底层 C++ 网络栈直接处理，彻底消灭 51 秒断流死锁！
-    if (req.destination === 'video' || req.destination === 'audio' || req.headers.has('range') || url.pathname.includes('videoplayback') || url.pathname.includes('live=1')) {
-        return; // 直接放行，不走 event.respondWith
-    }
-
+    // 1. 本地框架资源白名单
     if (url.origin === self.location.origin && !isProxyRequest(url)) {
         const p = url.pathname;
         if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return; 
@@ -59,18 +55,27 @@ self.addEventListener("fetch", (event) => {
         return; 
     }
 
+    // 2. 第三方跨域及绝对路径脱逃请求代理拦截
     if (!isProxyRequest(url) && url.origin !== self.location.origin) {
         let correctUrl = `${self.location.origin}/${url.href}`;
         if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
         return event.respondWith(proxyNetworkFetch(req, correctUrl));
     }
 
+    // 3. 【核心修复】视频流/音频流/直播流直通隧道 (彻底修复 0:00 报错与 51 秒断流)
+    // 强制使用纯管道直通，绝对不允许进入 Cache 缓存层，防止内存与流管道死锁！
+    if (req.headers.has('range') || url.pathname.includes('videoplayback') || url.pathname.includes('live=1')) {
+        return event.respondWith(proxyNetworkFetch(req, req.url));
+    }
+
+    // 4. 文档优先及静态缓存
     if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
         return event.respondWith(handleDocumentRequest(req));
     }
     event.respondWith(handleStaticResource(req));
 });
 
+// 安全纯净的网络代理转发
 async function proxyNetworkFetch(req, targetUrl) {
     const fetchOpts = {
         method: req.method, headers: req.headers, redirect: "manual",
