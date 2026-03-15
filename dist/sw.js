@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v20)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Ultimate v18)
 
-const VERSION = "v1.0.0-202603152317";
+const VERSION = "v1.0.0-202603152322";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 120;
@@ -18,7 +18,10 @@ self.addEventListener("activate", (event) => {
     );
 });
 
-function isProxyRequest(url) { return url.pathname.match(/^\/https?:\/\//i); }
+function isProxyRequest(url) { 
+    return url.pathname.match(/^\/https?:\/\//i); 
+}
+
 function getTargetOrigin(url) { 
     try { 
         let clean = url.pathname.slice(1).replace(/^(https?):\/+/, "$1://");
@@ -27,6 +30,7 @@ function getTargetOrigin(url) {
     } catch { return ""; } 
 }
 
+// 找回被降级处理的单页应用 SPA / Web Worker 脱逃源点
 function getTargetOriginFromReferrer(request) {
     try {
         const ref = request.referrer;
@@ -46,52 +50,54 @@ self.addEventListener("fetch", (event) => {
         const p = url.pathname;
         if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return; 
         
+        // 拦截 SPA 或 Web Worker 遗漏的隐藏 API 相对路径
         const targetOrigin = getTargetOriginFromReferrer(req);
         if (targetOrigin) {
             const correctUrl = `${self.location.origin}/${targetOrigin}${url.pathname}${url.search}`;
             if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
-            return event.respondWith(proxyNetworkFetch(req, correctUrl));
+            const fetchOpts = {
+                method: req.method, headers: req.headers, redirect: "manual",
+                mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
+                credentials: req.credentials
+            };
+            if (req.body && !['GET', 'HEAD'].includes(req.method)) {
+                fetchOpts.body = req.body; fetchOpts.duplex = 'half';
+            }
+            return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
         }
         return; 
     }
 
-    // 2. 第三方跨域及绝对路径脱逃请求代理拦截
+    // 2. 第三方跨域逃逸黑洞捕获 (核心兜底)
     if (!isProxyRequest(url) && url.origin !== self.location.origin) {
         let correctUrl = `${self.location.origin}/${url.href}`;
         if (req.mode === 'navigate') return event.respondWith(Response.redirect(correctUrl, 302));
-        return event.respondWith(proxyNetworkFetch(req, correctUrl));
+        
+        const fetchOpts = {
+            method: req.method, headers: req.headers, redirect: "manual",
+            mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
+            credentials: req.credentials
+        };
+        if (req.body && !['GET', 'HEAD'].includes(req.method)) {
+            fetchOpts.body = req.body; fetchOpts.duplex = 'half';
+        }
+        return event.respondWith(fetch(correctUrl, fetchOpts).then(res => processRedirectResponse(res, correctUrl)));
     }
 
-    // 3. 【核心修复】视频流/音频流/直播流直通隧道 (彻底修复 0:00 报错与 51 秒断流)
-    // 强制使用纯管道直通，绝对不允许进入 Cache 缓存层，防止内存与流管道死锁！
-    if (req.headers.has('range') || url.pathname.includes('videoplayback') || url.pathname.includes('live=1')) {
-        return event.respondWith(proxyNetworkFetch(req, req.url));
+    // 3. 媒体流/直播流直通隧道 (防止 CF Edge 断连)
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
+    }
+    if (req.headers.has("range") || url.pathname.includes("videoplayback") || url.pathname.includes("live=1")) {
+        return event.respondWith(fetch(req).then(res => processRedirectResponse(res, req.url)));
     }
 
-    // 4. 文档优先及静态缓存
+    // 4. 文档优先及静态极速缓存
     if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
         return event.respondWith(handleDocumentRequest(req));
     }
     event.respondWith(handleStaticResource(req));
 });
-
-// 安全纯净的网络代理转发
-async function proxyNetworkFetch(req, targetUrl) {
-    const fetchOpts = {
-        method: req.method, headers: req.headers, redirect: "manual",
-        mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
-        credentials: "include" 
-    };
-    if (req.body && !['GET', 'HEAD'].includes(req.method)) {
-        fetchOpts.body = req.body; fetchOpts.duplex = 'half';
-    }
-    try {
-        const res = await fetch(targetUrl, fetchOpts);
-        return processRedirectResponse(res, targetUrl);
-    } catch (e) {
-        return new Response("Proxy Gateway Offline", { status: 504 });
-    }
-}
 
 function processRedirectResponse(response, reqUrl) {
     if (response.status >= 300 && response.status < 400) {
