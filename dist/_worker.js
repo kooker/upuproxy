@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v18)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v21)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -27,19 +27,22 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL format", { status: 400 }); }
 
-    // 【1. 完美阻击端口报错】优雅拦截 CF 网络物理层不支持的端口，避免出现误导性的 Error 1003
+    // 【关键修复】补全裸域名的末尾斜杠，防止相对路径(如 /misc.php)解析出错
+    if (clean === target.origin && !request.url.endsWith('/')) {
+        return Response.redirect(`${url.origin}/${clean}/`, 301);
+    }
+
     if (target.port) {
         const portNum = Number(target.port);
         const CF_SUPPORTED_PORTS =[80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096];
         if (!CF_SUPPORTED_PORTS.includes(portNum)) {
             return new Response(
-                `Gateway Connection Rejected\n\nCloudflare edge network strictly prohibits proxying to non-standard port [${portNum}].\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
+                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nThis is a Cloudflare physical network limit, not a proxy bug.\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
                 { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" } }
             );
         }
     }
 
-    // 【跨域预检接管】
     if (request.method === "OPTIONS") {
         let origin = request.headers.get("Origin");
         return new Response(null, {
@@ -58,16 +61,20 @@ async function handleRequest(request, env) {
     headers.set("Host", target.host);
 
     let trueOrigin = target.origin;
-    const clientReferer = request.headers.get("Referer");
-    if (clientReferer) {
-        try {
-            const parsedClientRef = new URL(clientReferer);
-            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
-            if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
-            else { headers.set("Referer", target.href); }
-        } catch { headers.set("Referer", target.href); }
-    } else { headers.set("Referer", target.href); }
-    headers.set("Origin", trueOrigin);
+    if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
+        headers.set("Origin", "https://www.youtube.com"); headers.set("Referer", "https://www.youtube.com/");
+    } else {
+        const clientReferer = request.headers.get("Referer");
+        if (clientReferer) {
+            try {
+                const parsedClientRef = new URL(clientReferer);
+                let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
+                if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
+                else { headers.set("Referer", target.href); }
+            } catch { headers.set("Referer", target.href); }
+        } else { headers.set("Referer", target.href); }
+        headers.set("Origin", trueOrigin);
+    }
     
     headers.set("X-Forwarded-Host", target.host);
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
@@ -98,9 +105,8 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
-    // 【2. YouTube Live 断流核心防御】强制干掉 Cloudflare Edge 对流媒体切片的火箭缓冲拦截！
     if (target.pathname.includes("videoplayback") || clean.includes("live=1") || clean.includes("m3u8")) {
-        newHeaders.set('Cache-Control', 'no-store, no-transform');
+        newHeaders.set('Cache-Control', 'no-store, no-cache, no-transform, must-revalidate');
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
@@ -111,7 +117,7 @@ async function handleRequest(request, env) {
     if (isHTML) return rewriteHTML(response, newHeaders, url, target);
     if (isXML) return rewriteTextResource(response, newHeaders, url, target);
     if (isCSS) return rewriteCSSResponse(response, newHeaders, url, target);
-    if (isJS) return rewriteJSResponse(response, newHeaders, url, target); // JS 代码全维度 Hook 注入
+    if (isJS) return rewriteJSResponse(response, newHeaders, url, target);
 
     return new Response(response.body, { status: response.status, headers: newHeaders });
 }
@@ -166,33 +172,48 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
     return new Response(css, { status: res.status, headers });
 }
 
-// 【3. 全球独创：Web Worker 深层渗透注入】(彻底解决 YouTube SPA 依赖 Web Worker 发起无凭证 API 请求导致的 59 秒断流)
 async function rewriteJSResponse(res, headers, proxy, target) {
     let js = await res.text();
+    // 【核心修复】智能 JSON 嗅探：防止污染 DuckDuckGo 等框架用 text/javascript 伪装的 JSON 接口
+    let trimmed = js.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        return new Response(js, { status: res.status, headers });
+    }
     const hookCode = `
-/* UPP WebWorker Depth Hook */
 ;(function(){
     if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
         self.__UP_HOOKED = true;
         const __ProxyOrigin = "${proxy.origin}";
         const __TargetOrigin = "${target.origin}";
-        self.__UP_TARGET = __TargetOrigin;
         function toProxyUrl(urlStr) {
-            if (!urlStr) return urlStr;
-            let str = urlStr.toString();
+            if (!urlStr) return urlStr; let str = urlStr.toString();
             if (str.startsWith(__ProxyOrigin + '/http')) return str;
             if (str.startsWith(__ProxyOrigin + '/')) {
                 let path = str.slice(__ProxyOrigin.length);
-                if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } 
-                else return str;
+                if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } else return str;
             }
             try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
         }
         const _fetch = self.fetch;
-        self.fetch = async (u, opt) => {
-            try { if (u instanceof Request) u = new Request(toProxyUrl(u.url), u); else u = toProxyUrl(u); } catch(e) {}
-            if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
-            return _fetch(u, opt);
+        self.fetch = async function(resource, options) {
+            let u;
+            try { 
+                u = resource instanceof Request ? resource.url : resource;
+                let pUrl = toProxyUrl(u);
+                if (pUrl !== u) {
+                    if (resource instanceof Request) {
+                        const overrideOpts = {
+                            method: resource.method, headers: resource.headers,
+                            mode: resource.mode === 'navigate' ? 'cors' : resource.mode,
+                            credentials: 'include', cache: resource.cache, redirect: resource.redirect
+                        };
+                        if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
+                        resource = new Request(pUrl, overrideOpts);
+                    } else { resource = pUrl; }
+                }
+            } catch(e) {}
+            if (options) { options.credentials = "include"; } else { options = { credentials: "include" }; }
+            return _fetch(resource, options);
         };
         const _open = self.XMLHttpRequest.prototype.open;
         self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
@@ -200,19 +221,6 @@ async function rewriteJSResponse(res, headers, proxy, target) {
         };
         const _send = self.XMLHttpRequest.prototype.send;
         self.XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
-        const _WebSocket = self.WebSocket;
-        if (_WebSocket) {
-            self.WebSocket = function(url, protocols) {
-                try { 
-                    let wsUrl = new URL(url.toString(), __TargetOrigin);
-                    if (wsUrl.protocol === 'ws:' || wsUrl.protocol === 'wss:') {
-                        let targetUrl = (wsUrl.protocol === 'ws:' ? 'http:' : 'https:') + '//' + wsUrl.host + wsUrl.pathname + wsUrl.search;
-                        url = __ProxyOrigin.replace('http', 'ws') + '/' + targetUrl;
-                    }
-                } catch(e) {}
-                return protocols ? new _WebSocket(url, protocols) : new _WebSocket(url);
-            };
-        }
     }
 })();
 `;
@@ -285,22 +293,36 @@ class InjectSandbox {
     window.__UP_TARGET = __TargetOrigin;
 
     function toProxyUrl(urlStr) {
-        if (!urlStr) return urlStr;
-        let str = urlStr.toString();
+        if (!urlStr) return urlStr; let str = urlStr.toString();
         if (str.startsWith(__ProxyOrigin + '/http')) return str;
         if (str.startsWith(__ProxyOrigin + '/')) {
             let path = str.slice(__ProxyOrigin.length);
-            if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } 
-            else { return str; }
+            if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } else { return str; }
         }
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
+    // 【修复 YouTube 崩溃】无损沙箱重写，避免破坏底层的 Request 对象指针导致报错
     const _fetch = window.fetch;
-    window.fetch = async (u, opt) => {
-        try { if (u instanceof Request) u = new Request(toProxyUrl(u.url), u); else u = toProxyUrl(u); } catch(e) {}
-        if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
-        return _fetch(u, opt);
+    window.fetch = async function(resource, options) {
+        let u;
+        try { 
+            u = resource instanceof Request ? resource.url : resource;
+            let pUrl = toProxyUrl(u);
+            if (pUrl !== u) {
+                if (resource instanceof Request) {
+                    const overrideOpts = {
+                        method: resource.method, headers: resource.headers,
+                        mode: resource.mode === 'navigate' ? 'cors' : resource.mode,
+                        credentials: 'include', cache: resource.cache, redirect: resource.redirect
+                    };
+                    if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
+                    resource = new Request(pUrl, overrideOpts);
+                } else { resource = pUrl; }
+            }
+        } catch(e) {}
+        if (options) { options.credentials = "include"; } else { options = { credentials: "include" }; }
+        return _fetch(resource, options);
     };
 
     const _open = XMLHttpRequest.prototype.open;
@@ -310,7 +332,6 @@ class InjectSandbox {
     const _send = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
 
-    // YouTube LiveChat 动态 WebSocket 捕获
     const _WebSocket = window.WebSocket;
     if (_WebSocket) {
         window.WebSocket = function(url, protocols) {
@@ -334,27 +355,39 @@ class InjectSandbox {
         if (url) { try { url = toProxyUrl(url); } catch(e){} } return _replace.call(this, state, title, url);
     };
 
+    // 【关键修复】深度劫持 DOM 属性变动：解决 Discuz! jQuery 动态更改 img.src 无法显示验证码的问题
     const observer = new MutationObserver(mutations => {
         mutations.forEach(m => {
-            m.addedNodes.forEach(n => {
-                if (n.nodeType === 1) { 
-                    const fixAttr = (node) => {
-                        ['href', 'src', 'action'].forEach(attr => {
-                            if (node.hasAttribute && node.hasAttribute(attr)) {
-                                let val = node.getAttribute(attr);
-                                if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
-                                    try { node.setAttribute(attr, toProxyUrl(val)); } catch(e){}
-                                }
-                            }
-                        });
-                    };
-                    fixAttr(n);
-                    if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
+            if (m.type === 'attributes') {
+                const attr = m.attributeName;
+                if (['href', 'src', 'action'].includes(attr)) {
+                    let val = m.target.getAttribute(attr);
+                    if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
+                        try { m.target.setAttribute(attr, toProxyUrl(val)); } catch(e){}
+                    }
                 }
-            });
+            }
+            if (m.type === 'childList') {
+                m.addedNodes.forEach(n => {
+                    if (n.nodeType === 1) { 
+                        const fixAttr = (node) => {['href', 'src', 'action'].forEach(attr => {
+                                if (node.hasAttribute && node.hasAttribute(attr)) {
+                                    let val = node.getAttribute(attr);
+                                    if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
+                                        try { node.setAttribute(attr, toProxyUrl(val)); } catch(e){}
+                                    }
+                                }
+                            });
+                        };
+                        fixAttr(n);
+                        if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
+                    }
+                });
+            }
         });
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    // 强制监听 attributes 修改事件，彻底杜绝所有遗漏
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'action'] });
 
     if("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0)); }
 })();
