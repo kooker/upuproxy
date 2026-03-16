@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v22)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v23)
 
-const VERSION = "v1.0.0-202603162242";
+const VERSION = "v1.0.0-202603162308";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 120;
@@ -53,6 +53,7 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
+    // 【核心修复一】音视频流彻底旁路，交由浏览器 C++ 网络栈原生处理，根除 59 秒断流！
     if (req.destination === 'video' || req.destination === 'audio') {
         return; 
     }
@@ -63,9 +64,7 @@ self.addEventListener("fetch", (event) => {
             if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return fetch(req); 
             
             let targetOrigin = getTargetOriginFromReferrer(req);
-            if (!targetOrigin && req.clientId) {
-                targetOrigin = await getTargetOriginFromClient(req.clientId);
-            }
+            if (!targetOrigin && req.clientId) targetOrigin = await getTargetOriginFromClient(req.clientId);
 
             if (targetOrigin) {
                 const correctUrl = `${self.location.origin}/${targetOrigin}${url.pathname}${url.search}`;
@@ -95,9 +94,8 @@ self.addEventListener("fetch", (event) => {
 async function proxyNetworkFetch(req, targetUrl) {
     const fetchOpts = {
         method: req.method, headers: req.headers, 
-        // 【关键修复】必须为 manual，否则浏览器底层自动跟随跳转会导致 Set-Cookie 丢失，引发 Discuz 无法登录和死循环
-        redirect: "manual", 
-        // 还原真实请求模式，绝不能把 no-cors 强转为 cors，否则会被 YouTube 识别为恶意爬虫机器人
+        // 【关键修复二】恢复原生 redirect！让 AJAX 请求能够自动追踪 302 写入 Cookie，解决 Discuz / Typecho 无限死循环！
+        redirect: req.redirect, 
         mode: req.mode === 'navigate' ? 'same-origin' : req.mode,
         credentials: "include" 
     };
