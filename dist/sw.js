@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v21)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v22)
 
-const VERSION = "v1.0.0-202603162221";
+const VERSION = "v1.0.0-202603162242";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 120;
@@ -37,7 +37,6 @@ function getTargetOriginFromReferrer(request) {
     return null;
 }
 
-// 【黑科技：时空回溯】解决 Discuz / DuckDuckGo 丢失 Referrer 的绝杀方案
 async function getTargetOriginFromClient(clientId) {
     if (!clientId) return null;
     try {
@@ -54,19 +53,16 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 绝对旁路：视频/音频/直播流直接交由浏览器 C++ 底层处理，绝生死锁与 0:00 播放错误
     if (req.destination === 'video' || req.destination === 'audio') {
         return; 
     }
 
     event.respondWith((async () => {
-        // 1. 本地框架与相对路径遗漏兜底
         if (url.origin === self.location.origin && !isProxyRequest(url)) {
             const p = url.pathname;
             if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return fetch(req); 
             
             let targetOrigin = getTargetOriginFromReferrer(req);
-            // Referrer 丢失时，通过 Client ID 强行回溯宿主页面环境！
             if (!targetOrigin && req.clientId) {
                 targetOrigin = await getTargetOriginFromClient(req.clientId);
             }
@@ -79,19 +75,16 @@ self.addEventListener("fetch", (event) => {
             return fetch(req); 
         }
 
-        // 2. 第三方跨域及脱逃绝对路径
         if (!isProxyRequest(url) && url.origin !== self.location.origin) {
             let correctUrl = `${self.location.origin}/${url.href}`;
             if (req.mode === 'navigate') return Response.redirect(correctUrl, 302);
             return proxyNetworkFetch(req, correctUrl);
         }
 
-        // 3. 动态切片直通隧道
         if (req.headers.has('range') || url.pathname.includes('videoplayback') || url.pathname.includes('live=1')) {
             return proxyNetworkFetch(req, req.url);
         }
 
-        // 4. 文档优先及静态缓存
         if (req.destination === "document" || req.mode === "navigate" || url.pathname.endsWith(".xml")) {
             return handleDocumentRequest(req);
         }
@@ -102,8 +95,10 @@ self.addEventListener("fetch", (event) => {
 async function proxyNetworkFetch(req, targetUrl) {
     const fetchOpts = {
         method: req.method, headers: req.headers, 
-        redirect: req.redirect || "follow", // 修复 AJAX 框架遇到 302 跳转崩溃的问题
-        mode: req.mode === 'navigate' ? 'cors' : (req.mode === 'no-cors' ? 'no-cors' : 'cors'),
+        // 【关键修复】必须为 manual，否则浏览器底层自动跟随跳转会导致 Set-Cookie 丢失，引发 Discuz 无法登录和死循环
+        redirect: "manual", 
+        // 还原真实请求模式，绝不能把 no-cors 强转为 cors，否则会被 YouTube 识别为恶意爬虫机器人
+        mode: req.mode === 'navigate' ? 'same-origin' : req.mode,
         credentials: "include" 
     };
     if (req.body && !['GET', 'HEAD'].includes(req.method)) {
@@ -111,7 +106,6 @@ async function proxyNetworkFetch(req, targetUrl) {
     }
     try {
         const res = await fetch(targetUrl, fetchOpts);
-        if (res.redirected) return res; 
         return processRedirectResponse(res, targetUrl);
     } catch (e) {
         return new Response("Proxy Gateway Offline", { status: 504 });
