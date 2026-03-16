@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v23)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v22)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -59,27 +59,25 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
+    // 【核心修复一】恢复客户端真实 IP 穿透，这是 Discuz 保持登录态和 Typecho 防止死循环退出的绝对命门！
     const clientIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for");
     if (clientIP) {
-        headers.set("X-Forwarded-For", clientIP); headers.set("X-Real-IP", clientIP);
+        headers.set("X-Forwarded-For", clientIP);
+        headers.set("X-Real-IP", clientIP);
     }
 
+    // 移除了上一版激进的 YouTube Referer 伪装，恢复原生追踪逻辑，防止触发 YouTube 的反爬虫风控模型
     let trueOrigin = target.origin;
-    // 【关键修复三】必须重新注入 YouTube 的 Origin 和 Referer！这是防止 Playback ID error / 403 的唯一手段！
-    if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
-        headers.set("Origin", "https://www.youtube.com"); headers.set("Referer", "https://www.youtube.com/");
-    } else {
-        const clientReferer = request.headers.get("Referer");
-        if (clientReferer) {
-            try {
-                const parsedClientRef = new URL(clientReferer);
-                let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
-                if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
-                else { headers.set("Referer", target.href); }
-            } catch { headers.set("Referer", target.href); }
-        } else { headers.set("Referer", target.href); }
-        headers.set("Origin", trueOrigin);
-    }
+    const clientReferer = request.headers.get("Referer");
+    if (clientReferer) {
+        try {
+            const parsedClientRef = new URL(clientReferer);
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
+            if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
+            else { headers.set("Referer", target.href); }
+        } catch { headers.set("Referer", target.href); }
+    } else { headers.set("Referer", target.href); }
+    headers.set("Origin", trueOrigin);
     
     headers.set("X-Forwarded-Host", target.host);
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
@@ -146,12 +144,15 @@ function rewriteLocation(response, headers, proxy, target) {
 }
 
 function rewriteCookies(headers, proxy) {
+    // 【核心修复二】严格暴力重写 Cookies：斩断原站点自定义的 Path 和 Domain 造成的 Session 脱离，解决无法登录！
     if (typeof headers.getSetCookie === 'function') {
         const cookies = headers.getSetCookie();
         if (cookies.length === 0) return;
         headers.delete("set-cookie");
         for (let cookie of cookies) {
+            // 无视一切后端的 Domain/Path 设定，强行擦除
             let newCookie = cookie.replace(/;\s*Domain=[^;]+/ig, "").replace(/;\s*Path=[^;]+/ig, "");
+            // 强行把所有验证凭据绑定到代理站的根节点，确保所有请求必带 Cookie！
             newCookie += `; Domain=${new URL(proxy.origin).hostname}; Path=/`;
             if (!/;\s*SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
             if (!/;\s*Secure/i.test(newCookie)) newCookie += "; Secure";
@@ -199,30 +200,25 @@ async function rewriteJSResponse(res, headers, proxy, target) {
         }
         const _fetch = self.fetch;
         self.fetch = async function(resource, options) {
-            let pUrl = resource instanceof Request ? resource.url : resource;
-            pUrl = toProxyUrl(pUrl);
-            if (!options) options = {};
-            options.credentials = options.credentials || "include";
-            
-            if (resource instanceof Request) {
-                // 【核心修复四】直接继承源请求体的全部元数据和 ReadableStream，彻底避免强行 Clone 导致的抛错和 YouTube 指标流中断！
-                const overrideOpts = {
-                    method: resource.method,
-                    headers: resource.headers,
-                    body: resource.body, 
-                    mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
-                    credentials: resource.credentials || options.credentials,
-                    cache: resource.cache,
-                    redirect: resource.redirect,
-                    referrer: resource.referrer,
-                    referrerPolicy: resource.referrerPolicy,
-                    integrity: resource.integrity,
-                    keepalive: resource.keepalive,
-                    signal: resource.signal
-                };
-                return _fetch(pUrl, overrideOpts);
-            }
-            return _fetch(pUrl, options);
+            let u;
+            try { 
+                u = resource instanceof Request ? resource.url : resource;
+                let pUrl = toProxyUrl(u);
+                if (pUrl !== u) {
+                    if (resource instanceof Request) {
+                        const overrideOpts = {
+                            method: resource.method, headers: resource.headers,
+                            // 【关键修复三】保持原生 Mode 不变！强改 no-cors 为 cors 会被 YouTube 反爬虫风控瞬间识别！
+                            mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
+                            credentials: 'include', cache: resource.cache, redirect: resource.redirect
+                        };
+                        if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
+                        resource = new Request(pUrl, overrideOpts);
+                    } else { resource = pUrl; }
+                }
+            } catch(e) {}
+            if (options) { options.credentials = "include"; } else { options = { credentials: "include" }; }
+            return _fetch(resource, options);
         };
         const _open = self.XMLHttpRequest.prototype.open;
         self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
@@ -313,25 +309,24 @@ class InjectSandbox {
 
     const _fetch = window.fetch;
     window.fetch = async function(resource, options) {
-        let pUrl = resource instanceof Request ? resource.url : resource;
-        pUrl = toProxyUrl(pUrl);
-        if (!options) options = {};
-        options.credentials = options.credentials || "include";
-        
-        if (resource instanceof Request) {
-            const overrideOpts = {
-                method: resource.method, headers: resource.headers,
-                body: resource.body, 
-                mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
-                credentials: resource.credentials || options.credentials,
-                cache: resource.cache, redirect: resource.redirect,
-                referrer: resource.referrer, referrerPolicy: resource.referrerPolicy,
-                integrity: resource.integrity, keepalive: resource.keepalive,
-                signal: resource.signal
-            };
-            return _fetch(pUrl, overrideOpts);
-        }
-        return _fetch(pUrl, options);
+        let u;
+        try { 
+            u = resource instanceof Request ? resource.url : resource;
+            let pUrl = toProxyUrl(u);
+            if (pUrl !== u) {
+                if (resource instanceof Request) {
+                    const overrideOpts = {
+                        method: resource.method, headers: resource.headers,
+                        mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
+                        credentials: 'include', cache: resource.cache, redirect: resource.redirect
+                    };
+                    if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
+                    resource = new Request(pUrl, overrideOpts);
+                } else { resource = pUrl; }
+            }
+        } catch(e) {}
+        if (options) { options.credentials = "include"; } else { options = { credentials: "include" }; }
+        return _fetch(resource, options);
     };
 
     const _open = XMLHttpRequest.prototype.open;
