@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v21)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v22)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -27,7 +27,6 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL format", { status: 400 }); }
 
-    // 【关键修复】补全裸域名的末尾斜杠，防止相对路径(如 /misc.php)解析出错
     if (clean === target.origin && !request.url.endsWith('/')) {
         return Response.redirect(`${url.origin}/${clean}/`, 301);
     }
@@ -60,25 +59,28 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
-    let trueOrigin = target.origin;
-    if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
-        headers.set("Origin", "https://www.youtube.com"); headers.set("Referer", "https://www.youtube.com/");
-    } else {
-        const clientReferer = request.headers.get("Referer");
-        if (clientReferer) {
-            try {
-                const parsedClientRef = new URL(clientReferer);
-                let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
-                if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
-                else { headers.set("Referer", target.href); }
-            } catch { headers.set("Referer", target.href); }
-        } else { headers.set("Referer", target.href); }
-        headers.set("Origin", trueOrigin);
+    // 【核心修复一】恢复客户端真实 IP 穿透，这是 Discuz 保持登录态和 Typecho 防止死循环退出的绝对命门！
+    const clientIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for");
+    if (clientIP) {
+        headers.set("X-Forwarded-For", clientIP);
+        headers.set("X-Real-IP", clientIP);
     }
+
+    // 移除了上一版激进的 YouTube Referer 伪装，恢复原生追踪逻辑，防止触发 YouTube 的反爬虫风控模型
+    let trueOrigin = target.origin;
+    const clientReferer = request.headers.get("Referer");
+    if (clientReferer) {
+        try {
+            const parsedClientRef = new URL(clientReferer);
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
+            if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
+            else { headers.set("Referer", target.href); }
+        } catch { headers.set("Referer", target.href); }
+    } else { headers.set("Referer", target.href); }
+    headers.set("Origin", trueOrigin);
     
     headers.set("X-Forwarded-Host", target.host);
     headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
-    ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
     const fetchOpts = { method: request.method, headers, redirect: "manual" };
     if (!["GET", "HEAD"].includes(request.method) && request.body) {
@@ -142,14 +144,18 @@ function rewriteLocation(response, headers, proxy, target) {
 }
 
 function rewriteCookies(headers, proxy) {
+    // 【核心修复二】严格暴力重写 Cookies：斩断原站点自定义的 Path 和 Domain 造成的 Session 脱离，解决无法登录！
     if (typeof headers.getSetCookie === 'function') {
         const cookies = headers.getSetCookie();
         if (cookies.length === 0) return;
         headers.delete("set-cookie");
         for (let cookie of cookies) {
-            let newCookie = cookie.replace(/domain=[^;]+/gi, "Domain=" + new URL(proxy.origin).hostname).replace(/path=[^;]+/gi, "Path=/");
-            if (!/SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
-            if (!/Secure/i.test(newCookie)) newCookie += "; Secure";
+            // 无视一切后端的 Domain/Path 设定，强行擦除
+            let newCookie = cookie.replace(/;\s*Domain=[^;]+/ig, "").replace(/;\s*Path=[^;]+/ig, "");
+            // 强行把所有验证凭据绑定到代理站的根节点，确保所有请求必带 Cookie！
+            newCookie += `; Domain=${new URL(proxy.origin).hostname}; Path=/`;
+            if (!/;\s*SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
+            if (!/;\s*Secure/i.test(newCookie)) newCookie += "; Secure";
             headers.append("set-cookie", newCookie);
         }
     }
@@ -174,11 +180,9 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
 
 async function rewriteJSResponse(res, headers, proxy, target) {
     let js = await res.text();
-    // 【核心修复】智能 JSON 嗅探：防止污染 DuckDuckGo 等框架用 text/javascript 伪装的 JSON 接口
     let trimmed = js.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        return new Response(js, { status: res.status, headers });
-    }
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) return new Response(js, { status: res.status, headers });
+    
     const hookCode = `
 ;(function(){
     if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
@@ -204,7 +208,8 @@ async function rewriteJSResponse(res, headers, proxy, target) {
                     if (resource instanceof Request) {
                         const overrideOpts = {
                             method: resource.method, headers: resource.headers,
-                            mode: resource.mode === 'navigate' ? 'cors' : resource.mode,
+                            // 【关键修复三】保持原生 Mode 不变！强改 no-cors 为 cors 会被 YouTube 反爬虫风控瞬间识别！
+                            mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
                             credentials: 'include', cache: resource.cache, redirect: resource.redirect
                         };
                         if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
@@ -302,7 +307,6 @@ class InjectSandbox {
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
-    // 【修复 YouTube 崩溃】无损沙箱重写，避免破坏底层的 Request 对象指针导致报错
     const _fetch = window.fetch;
     window.fetch = async function(resource, options) {
         let u;
@@ -313,7 +317,7 @@ class InjectSandbox {
                 if (resource instanceof Request) {
                     const overrideOpts = {
                         method: resource.method, headers: resource.headers,
-                        mode: resource.mode === 'navigate' ? 'cors' : resource.mode,
+                        mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
                         credentials: 'include', cache: resource.cache, redirect: resource.redirect
                     };
                     if (resource.method !== 'GET' && resource.method !== 'HEAD') { try { overrideOpts.body = await resource.clone().blob(); } catch(e) {} }
@@ -355,7 +359,6 @@ class InjectSandbox {
         if (url) { try { url = toProxyUrl(url); } catch(e){} } return _replace.call(this, state, title, url);
     };
 
-    // 【关键修复】深度劫持 DOM 属性变动：解决 Discuz! jQuery 动态更改 img.src 无法显示验证码的问题
     const observer = new MutationObserver(mutations => {
         mutations.forEach(m => {
             if (m.type === 'attributes') {
@@ -386,7 +389,6 @@ class InjectSandbox {
             }
         });
     });
-    // 强制监听 attributes 修改事件，彻底杜绝所有遗漏
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'action'] });
 
     if("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0)); }
