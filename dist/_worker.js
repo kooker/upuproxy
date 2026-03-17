@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v24)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v23)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -36,7 +36,7 @@ async function handleRequest(request, env) {
         const CF_SUPPORTED_PORTS =[80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096];
         if (!CF_SUPPORTED_PORTS.includes(portNum)) {
             return new Response(
-                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
+                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nThis is a Cloudflare physical network limit, not a proxy bug.\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
                 { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" } }
             );
         }
@@ -65,6 +65,7 @@ async function handleRequest(request, env) {
     }
 
     let trueOrigin = target.origin;
+    // 【关键修复三】必须重新注入 YouTube 的 Origin 和 Referer！这是防止 Playback ID error / 403 的唯一手段！
     if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
         headers.set("Origin", "https://www.youtube.com"); headers.set("Referer", "https://www.youtube.com/");
     } else {
@@ -181,11 +182,6 @@ async function rewriteJSResponse(res, headers, proxy, target) {
     let trimmed = js.trim();
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) return new Response(js, { status: res.status, headers });
     
-    // 【关键修复一】Google 环境白名单检测：如果是谷歌身份验证请求，完全静默放行，不注入导致被识别拦截的 Sandbox 代码！
-    if (target.hostname.includes("accounts.google.com")) {
-        return new Response(js, { status: res.status, headers });
-    }
-
     const hookCode = `
 ;(function(){
     if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
@@ -207,14 +203,22 @@ async function rewriteJSResponse(res, headers, proxy, target) {
             pUrl = toProxyUrl(pUrl);
             if (!options) options = {};
             options.credentials = options.credentials || "include";
+            
             if (resource instanceof Request) {
+                // 【核心修复四】直接继承源请求体的全部元数据和 ReadableStream，彻底避免强行 Clone 导致的抛错和 YouTube 指标流中断！
                 const overrideOpts = {
-                    method: resource.method, headers: resource.headers, body: resource.body, 
+                    method: resource.method,
+                    headers: resource.headers,
+                    body: resource.body, 
                     mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
                     credentials: resource.credentials || options.credentials,
-                    cache: resource.cache, redirect: resource.redirect, referrer: resource.referrer,
-                    referrerPolicy: resource.referrerPolicy, integrity: resource.integrity,
-                    keepalive: resource.keepalive, signal: resource.signal
+                    cache: resource.cache,
+                    redirect: resource.redirect,
+                    referrer: resource.referrer,
+                    referrerPolicy: resource.referrerPolicy,
+                    integrity: resource.integrity,
+                    keepalive: resource.keepalive,
+                    signal: resource.signal
                 };
                 return _fetch(pUrl, overrideOpts);
             }
@@ -233,13 +237,8 @@ async function rewriteJSResponse(res, headers, proxy, target) {
 }
 
 function rewriteHTML(res, headers, proxy, target) {
-    let rewriter = new HTMLRewriter();
-    // 【关键修复二】对 Google 登录页面免杀，不注入可能触发不安全警告的 Hook 脚本
-    if (!target.hostname.includes("accounts.google.com")) {
-        rewriter = rewriter.on("head", new InjectSandbox(proxy, target));
-    }
-
-    return rewriter
+    return new HTMLRewriter()
+        .on("head", new InjectSandbox(proxy, target))
         .on("script, link", new RemoveIntegrity())
         .on("link[rel='canonical'], link[rel='alternate'], base[href]", new URLRewriter(proxy, target, "href"))
         .on("meta[property='og:url'], meta[property='og:image'], meta[name='twitter:url'], meta[name='twitter:image']", new URLRewriter(proxy, target, "content"))
@@ -312,42 +311,23 @@ class InjectSandbox {
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
-    // 【核心黑科技：DOM 底层原型链劫持】彻底消灭 Discuz 移动端由于 new Image().src 预加载导致的验证码图裂！
-    const hookProperty = (proto, prop) => {
-        if (!proto) return;
-        let desc = Object.getOwnPropertyDescriptor(proto, prop);
-        if (!desc || !desc.set) return;
-        Object.defineProperty(proto, prop, {
-            get: function() { return desc.get.call(this); },
-            set: function(val) {
-                if (val && typeof val === 'string' && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
-                    try { val = toProxyUrl(val); } catch(e){}
-                }
-                return desc.set.call(this, val);
-            }
-        });
-    };
-    // 暴力阻断 JS 在标签插入网页前就发起的错误网络请求！
-    hookProperty(HTMLImageElement.prototype, 'src');
-    hookProperty(HTMLScriptElement.prototype, 'src');
-    hookProperty(HTMLAnchorElement.prototype, 'href');
-    hookProperty(HTMLFormElement.prototype, 'action');
-    hookProperty(HTMLIFrameElement.prototype, 'src');
-
     const _fetch = window.fetch;
     window.fetch = async function(resource, options) {
         let pUrl = resource instanceof Request ? resource.url : resource;
         pUrl = toProxyUrl(pUrl);
         if (!options) options = {};
         options.credentials = options.credentials || "include";
+        
         if (resource instanceof Request) {
             const overrideOpts = {
-                method: resource.method, headers: resource.headers, body: resource.body, 
+                method: resource.method, headers: resource.headers,
+                body: resource.body, 
                 mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
                 credentials: resource.credentials || options.credentials,
                 cache: resource.cache, redirect: resource.redirect,
                 referrer: resource.referrer, referrerPolicy: resource.referrerPolicy,
-                integrity: resource.integrity, keepalive: resource.keepalive, signal: resource.signal
+                integrity: resource.integrity, keepalive: resource.keepalive,
+                signal: resource.signal
             };
             return _fetch(pUrl, overrideOpts);
         }
@@ -414,7 +394,7 @@ class InjectSandbox {
             }
         });
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter:['src', 'href', 'action'] });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'action'] });
 
     if("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0)); }
 })();
