@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v23)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v26)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -36,7 +36,7 @@ async function handleRequest(request, env) {
         const CF_SUPPORTED_PORTS =[80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096];
         if (!CF_SUPPORTED_PORTS.includes(portNum)) {
             return new Response(
-                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nThis is a Cloudflare physical network limit, not a proxy bug.\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
+                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
                 { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" } }
             );
         }
@@ -59,30 +59,30 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
-    const clientIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for");
-    if (clientIP) {
-        headers.set("X-Forwarded-For", clientIP); headers.set("X-Real-IP", clientIP);
+    // ==========================================
+    // 【终极黑科技：Elite Proxy 高匿模式开启】
+    // 抹除一切代理指纹，让 Whoer 侦测失效，让 YouTube 机器人防护网彻底瞎眼！
+    // ==========================================
+    const proxyHeaders =[
+        "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto",
+        "cf-connecting-ip", "cf-ray", "cf-visitor", "cf-ipcountry", "via", "forwarded"
+    ];
+    proxyHeaders.forEach(h => headers.delete(h));
+
+    // 智能动态镜像来源（替换原版的写死方案，完美兼容 YouTube SPA 动态单页路由验证）
+    let reqOrigin = headers.get("Origin");
+    if (reqOrigin && reqOrigin.includes(url.host)) {
+        headers.set("Origin", reqOrigin.replace(url.origin, target.origin));
+    } else if (!reqOrigin && request.method !== 'GET') {
+        headers.set("Origin", target.origin);
     }
 
-    let trueOrigin = target.origin;
-    // 【关键修复三】必须重新注入 YouTube 的 Origin 和 Referer！这是防止 Playback ID error / 403 的唯一手段！
-    if (target.hostname.includes('youtube.com') || target.hostname.includes('googlevideo.com')) {
-        headers.set("Origin", "https://www.youtube.com"); headers.set("Referer", "https://www.youtube.com/");
+    let reqReferer = headers.get("Referer");
+    if (reqReferer && reqReferer.includes(url.host)) {
+        headers.set("Referer", reqReferer.replace(url.origin, target.origin));
     } else {
-        const clientReferer = request.headers.get("Referer");
-        if (clientReferer) {
-            try {
-                const parsedClientRef = new URL(clientReferer);
-                let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
-                if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
-                else { headers.set("Referer", target.href); }
-            } catch { headers.set("Referer", target.href); }
-        } else { headers.set("Referer", target.href); }
-        headers.set("Origin", trueOrigin);
+        headers.set("Referer", target.href);
     }
-    
-    headers.set("X-Forwarded-Host", target.host);
-    headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
 
     const fetchOpts = { method: request.method, headers, redirect: "manual" };
     if (!["GET", "HEAD"].includes(request.method) && request.body) {
@@ -182,6 +182,10 @@ async function rewriteJSResponse(res, headers, proxy, target) {
     let trimmed = js.trim();
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) return new Response(js, { status: res.status, headers });
     
+    if (target.hostname.includes("accounts.google.com") || target.hostname.includes("myaccount.google.com")) {
+        return new Response(js, { status: res.status, headers });
+    }
+
     const hookCode = `
 ;(function(){
     if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
@@ -199,30 +203,28 @@ async function rewriteJSResponse(res, headers, proxy, target) {
         }
         const _fetch = self.fetch;
         self.fetch = async function(resource, options) {
-            let pUrl = resource instanceof Request ? resource.url : resource;
-            pUrl = toProxyUrl(pUrl);
-            if (!options) options = {};
-            options.credentials = options.credentials || "include";
-            
-            if (resource instanceof Request) {
-                // 【核心修复四】直接继承源请求体的全部元数据和 ReadableStream，彻底避免强行 Clone 导致的抛错和 YouTube 指标流中断！
-                const overrideOpts = {
-                    method: resource.method,
-                    headers: resource.headers,
-                    body: resource.body, 
-                    mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
-                    credentials: resource.credentials || options.credentials,
-                    cache: resource.cache,
-                    redirect: resource.redirect,
-                    referrer: resource.referrer,
-                    referrerPolicy: resource.referrerPolicy,
-                    integrity: resource.integrity,
-                    keepalive: resource.keepalive,
-                    signal: resource.signal
-                };
-                return _fetch(pUrl, overrideOpts);
+            try {
+                let isReq = resource instanceof Request;
+                let origUrl = isReq ? resource.url : resource.toString();
+                let pUrl = toProxyUrl(origUrl);
+                
+                if (pUrl === origUrl) {
+                    if (options) { options.credentials = "include"; return _fetch(resource, options); }
+                    return _fetch(resource, { credentials: "include" });
+                }
+
+                if (isReq) {
+                    let newInit = options || {};
+                    newInit.credentials = newInit.credentials || "include";
+                    return _fetch(new Request(pUrl, resource), newInit);
+                } else {
+                    if (!options) options = {};
+                    options.credentials = options.credentials || "include";
+                    return _fetch(pUrl, options);
+                }
+            } catch (e) {
+                return _fetch(resource, options);
             }
-            return _fetch(pUrl, options);
         };
         const _open = self.XMLHttpRequest.prototype.open;
         self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
@@ -237,8 +239,12 @@ async function rewriteJSResponse(res, headers, proxy, target) {
 }
 
 function rewriteHTML(res, headers, proxy, target) {
-    return new HTMLRewriter()
-        .on("head", new InjectSandbox(proxy, target))
+    let rewriter = new HTMLRewriter();
+    if (!target.hostname.includes("accounts.google.com") && !target.hostname.includes("myaccount.google.com")) {
+        rewriter = rewriter.on("head", new InjectSandbox(proxy, target));
+    }
+
+    return rewriter
         .on("script, link", new RemoveIntegrity())
         .on("link[rel='canonical'], link[rel='alternate'], base[href]", new URLRewriter(proxy, target, "href"))
         .on("meta[property='og:url'], meta[property='og:image'], meta[name='twitter:url'], meta[name='twitter:image']", new URLRewriter(proxy, target, "content"))
@@ -311,27 +317,67 @@ class InjectSandbox {
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
+    const origInnerHTML = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+    if (origInnerHTML) {
+        Object.defineProperty(Element.prototype, 'innerHTML', {
+            get: function() { return origInnerHTML.get.call(this); },
+            set: function(val) {
+                if (typeof val === 'string') {
+                    val = val.replace(/(src|href|action)\\s*=\\s*(['"])(?!http|data:|javascript:|#|\\/\\/)([^'"]+)\\2/ig, (match, attr, quote, path) => {
+                        try { return attr + '=' + quote + toProxyUrl(path) + quote; } catch(e) { return match; }
+                    });
+                }
+                return origInnerHTML.set.call(this, val);
+            }
+        });
+    }
+
+    const hookProperty = (proto, prop) => {
+        if (!proto) return;
+        let desc = Object.getOwnPropertyDescriptor(proto, prop);
+        if (!desc || !desc.set) return;
+        Object.defineProperty(proto, prop, {
+            get: function() { return desc.get.call(this); },
+            set: function(val) {
+                if (val && typeof val === 'string' && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
+                    try { val = toProxyUrl(val); } catch(e){}
+                }
+                return desc.set.call(this, val);
+            }
+        });
+    };
+    hookProperty(HTMLImageElement.prototype, 'src');
+    hookProperty(HTMLScriptElement.prototype, 'src');
+    hookProperty(HTMLAnchorElement.prototype, 'href');
+    hookProperty(HTMLFormElement.prototype, 'action');
+    hookProperty(HTMLIFrameElement.prototype, 'src');
+
+    // 【原生 Request 完美复刻】彻底解决导致 YouTube "Playback ID" 错误的 ReadableStream 克隆失败问题
     const _fetch = window.fetch;
     window.fetch = async function(resource, options) {
-        let pUrl = resource instanceof Request ? resource.url : resource;
-        pUrl = toProxyUrl(pUrl);
-        if (!options) options = {};
-        options.credentials = options.credentials || "include";
-        
-        if (resource instanceof Request) {
-            const overrideOpts = {
-                method: resource.method, headers: resource.headers,
-                body: resource.body, 
-                mode: resource.mode === 'navigate' ? 'same-origin' : resource.mode,
-                credentials: resource.credentials || options.credentials,
-                cache: resource.cache, redirect: resource.redirect,
-                referrer: resource.referrer, referrerPolicy: resource.referrerPolicy,
-                integrity: resource.integrity, keepalive: resource.keepalive,
-                signal: resource.signal
-            };
-            return _fetch(pUrl, overrideOpts);
+        try {
+            let isReq = resource instanceof Request;
+            let origUrl = isReq ? resource.url : resource.toString();
+            let pUrl = toProxyUrl(origUrl);
+            
+            if (pUrl === origUrl) {
+                if (options) { options.credentials = "include"; return _fetch(resource, options); }
+                return _fetch(resource, { credentials: "include" });
+            }
+
+            if (isReq) {
+                let newInit = options || {};
+                newInit.credentials = newInit.credentials || "include";
+                // 使用原 Request 作为底本直接实例化，由浏览器底层无损转移数据流状态，绝生死锁
+                return _fetch(new Request(pUrl, resource), newInit);
+            } else {
+                if (!options) options = {};
+                options.credentials = options.credentials || "include";
+                return _fetch(pUrl, options);
+            }
+        } catch(e) {
+            return _fetch(resource, options);
         }
-        return _fetch(pUrl, options);
     };
 
     const _open = XMLHttpRequest.prototype.open;
@@ -394,7 +440,7 @@ class InjectSandbox {
             }
         });
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'action'] });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter:['src', 'href', 'action'] });
 
     if("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0)); }
 })();
