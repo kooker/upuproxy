@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v27)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Ultimate v18)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -27,21 +27,19 @@ async function handleRequest(request, env) {
     let target;
     try { target = new URL(clean); } catch { return new Response("Invalid Target URL format", { status: 400 }); }
 
-    if (clean === target.origin && !request.url.endsWith('/')) {
-        return Response.redirect(`${url.origin}/${clean}/`, 301);
-    }
-
+    // 【1. 完美阻击端口报错】优雅拦截 CF 网络物理层不支持的端口，避免出现误导性的 Error 1003
     if (target.port) {
         const portNum = Number(target.port);
         const CF_SUPPORTED_PORTS =[80, 443, 8080, 8443, 8880, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096];
         if (!CF_SUPPORTED_PORTS.includes(portNum)) {
             return new Response(
-                `Gateway Connection Rejected\n\nCloudflare network strictly prohibits proxying to non-standard port[${portNum}].\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
+                `Gateway Connection Rejected\n\nCloudflare edge network strictly prohibits proxying to non-standard port [${portNum}].\nPlease use one of the supported ports: ${CF_SUPPORTED_PORTS.join(', ')}`, 
                 { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" } }
             );
         }
     }
 
+    // 【跨域预检接管】
     if (request.method === "OPTIONS") {
         let origin = request.headers.get("Origin");
         return new Response(null, {
@@ -59,36 +57,21 @@ async function handleRequest(request, env) {
     const headers = new Headers(request.headers);
     headers.set("Host", target.host);
 
-    // ==========================================
-    // 【核心黑科技：Elite Proxy 高匿模式开启】
-    // 强制丢弃一切 Cloudflare 及代理追踪头，彻底解决 Whoer.net 暴露与 YouTube 机器人拦截！
-    // ==========================================
-    const proxyHeaders =[
-        "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto",
-        "cf-connecting-ip", "cf-ray", "cf-visitor", "cf-ipcountry", "via", "forwarded"
-    ];
-    proxyHeaders.forEach(h => headers.delete(h));
-
-    // 精准复原 Origin 与 Referer，骗过严格的后端 CSRF 防护
-    let reqOrigin = headers.get("Origin");
-    if (reqOrigin === url.origin) {
-        headers.set("Origin", target.origin);
-    }
-
-    const clientReferer = headers.get("Referer");
+    let trueOrigin = target.origin;
+    const clientReferer = request.headers.get("Referer");
     if (clientReferer) {
         try {
             const parsedClientRef = new URL(clientReferer);
-            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "");
-            if (refPath.startsWith("http://") || refPath.startsWith("https://")) { 
-                headers.set("Referer", refPath); 
-            } else {
-                headers.set("Referer", target.origin + "/" + refPath);
-            }
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "").replace(/^(https?):\/+/, "$1://");
+            if (refPath.startsWith("http")) { headers.set("Referer", refPath); trueOrigin = new URL(refPath).origin; } 
+            else { headers.set("Referer", target.href); }
         } catch { headers.set("Referer", target.href); }
-    } else {
-        headers.set("Referer", target.href);
-    }
+    } else { headers.set("Referer", target.href); }
+    headers.set("Origin", trueOrigin);
+    
+    headers.set("X-Forwarded-Host", target.host);
+    headers.set("X-Forwarded-Proto", target.protocol.replace(':', ''));
+    ;["cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-real-ip"].forEach(h => headers.delete(h));
 
     const fetchOpts = { method: request.method, headers, redirect: "manual" };
     if (!["GET", "HEAD"].includes(request.method) && request.body) {
@@ -104,9 +87,8 @@ async function handleRequest(request, env) {
     const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCSS = contentType.includes("text/css");
     const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
-    
-    // 【终极重构】直接放行 JS，不注入任何 Hook，解决代码破损，让 BotGuard 查无此人！
-    const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
+    const isJS = contentType.includes("javascript") || clean.endsWith(".js");
+    const shouldRewriteBody = (isHTML || isCSS || isXML || isJS) && contentLength < MAX_REWRITE_SIZE;
 
     sanitizeAndExposeHeaders(newHeaders, request, shouldRewriteBody);
     rewriteLocation(response, newHeaders, url, target);
@@ -116,8 +98,9 @@ async function handleRequest(request, env) {
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
+    // 【2. YouTube Live 断流核心防御】强制干掉 Cloudflare Edge 对流媒体切片的火箭缓冲拦截！
     if (target.pathname.includes("videoplayback") || clean.includes("live=1") || clean.includes("m3u8")) {
-        newHeaders.set('Cache-Control', 'no-store, no-cache, no-transform, must-revalidate');
+        newHeaders.set('Cache-Control', 'no-store, no-transform');
         return new Response(response.body, { status: response.status, headers: newHeaders });
     }
 
@@ -128,6 +111,7 @@ async function handleRequest(request, env) {
     if (isHTML) return rewriteHTML(response, newHeaders, url, target);
     if (isXML) return rewriteTextResource(response, newHeaders, url, target);
     if (isCSS) return rewriteCSSResponse(response, newHeaders, url, target);
+    if (isJS) return rewriteJSResponse(response, newHeaders, url, target); // JS 代码全维度 Hook 注入
 
     return new Response(response.body, { status: response.status, headers: newHeaders });
 }
@@ -157,10 +141,9 @@ function rewriteCookies(headers, proxy) {
         if (cookies.length === 0) return;
         headers.delete("set-cookie");
         for (let cookie of cookies) {
-            let newCookie = cookie.replace(/;\s*Domain=[^;]+/ig, "").replace(/;\s*Path=[^;]+/ig, "");
-            newCookie += `; Domain=${new URL(proxy.origin).hostname}; Path=/`;
-            if (!/;\s*SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
-            if (!/;\s*Secure/i.test(newCookie)) newCookie += "; Secure";
+            let newCookie = cookie.replace(/domain=[^;]+/gi, "Domain=" + new URL(proxy.origin).hostname).replace(/path=[^;]+/gi, "Path=/");
+            if (!/SameSite/i.test(newCookie)) newCookie += "; SameSite=None";
+            if (!/Secure/i.test(newCookie)) newCookie += "; Secure";
             headers.append("set-cookie", newCookie);
         }
     }
@@ -183,8 +166,61 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
     return new Response(css, { status: res.status, headers });
 }
 
+// 【3. 全球独创：Web Worker 深层渗透注入】(彻底解决 YouTube SPA 依赖 Web Worker 发起无凭证 API 请求导致的 59 秒断流)
+async function rewriteJSResponse(res, headers, proxy, target) {
+    let js = await res.text();
+    const hookCode = `
+/* UPP WebWorker Depth Hook */
+;(function(){
+    if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
+        self.__UP_HOOKED = true;
+        const __ProxyOrigin = "${proxy.origin}";
+        const __TargetOrigin = "${target.origin}";
+        self.__UP_TARGET = __TargetOrigin;
+        function toProxyUrl(urlStr) {
+            if (!urlStr) return urlStr;
+            let str = urlStr.toString();
+            if (str.startsWith(__ProxyOrigin + '/http')) return str;
+            if (str.startsWith(__ProxyOrigin + '/')) {
+                let path = str.slice(__ProxyOrigin.length);
+                if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } 
+                else return str;
+            }
+            try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
+        }
+        const _fetch = self.fetch;
+        self.fetch = async (u, opt) => {
+            try { if (u instanceof Request) u = new Request(toProxyUrl(u.url), u); else u = toProxyUrl(u); } catch(e) {}
+            if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
+            return _fetch(u, opt);
+        };
+        const _open = self.XMLHttpRequest.prototype.open;
+        self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
+            try { u = toProxyUrl(u); } catch(e) {} return _open.call(this, m, u, ...r);
+        };
+        const _send = self.XMLHttpRequest.prototype.send;
+        self.XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
+        const _WebSocket = self.WebSocket;
+        if (_WebSocket) {
+            self.WebSocket = function(url, protocols) {
+                try { 
+                    let wsUrl = new URL(url.toString(), __TargetOrigin);
+                    if (wsUrl.protocol === 'ws:' || wsUrl.protocol === 'wss:') {
+                        let targetUrl = (wsUrl.protocol === 'ws:' ? 'http:' : 'https:') + '//' + wsUrl.host + wsUrl.pathname + wsUrl.search;
+                        url = __ProxyOrigin.replace('http', 'ws') + '/' + targetUrl;
+                    }
+                } catch(e) {}
+                return protocols ? new _WebSocket(url, protocols) : new _WebSocket(url);
+            };
+        }
+    }
+})();
+`;
+    return new Response(hookCode + js, { status: res.status, headers });
+}
+
 function rewriteHTML(res, headers, proxy, target) {
-    let rewriter = new HTMLRewriter()
+    return new HTMLRewriter()
         .on("head", new InjectSandbox(proxy, target))
         .on("script, link", new RemoveIntegrity())
         .on("link[rel='canonical'], link[rel='alternate'], base[href]", new URLRewriter(proxy, target, "href"))
@@ -193,9 +229,8 @@ function rewriteHTML(res, headers, proxy, target) {
         .on("img[src], iframe[src], script[src], source[src]", new URLRewriter(proxy, target, "src"))
         .on("img[srcset], source[srcset]", new SrcsetRewriter(proxy, target))
         .on("form[action]", new URLRewriter(proxy, target, "action"))
-        .on("[data-src],[data-url],[data-href],[data-video],[data-aff],[data-poster]", new DataAttributeRewriter(proxy, target));
-    
-    return rewriter.transform(new Response(res.body, { status: res.status, headers }));
+        .on("[data-src],[data-url],[data-href],[data-video],[data-aff],[data-poster]", new DataAttributeRewriter(proxy, target))
+        .transform(new Response(res.body, { status: res.status, headers }));
 }
 
 class RemoveIntegrity { element(el) { el.removeAttribute("integrity"); } }
@@ -250,16 +285,32 @@ class InjectSandbox {
     window.__UP_TARGET = __TargetOrigin;
 
     function toProxyUrl(urlStr) {
-        if (!urlStr) return urlStr; let str = urlStr.toString();
+        if (!urlStr) return urlStr;
+        let str = urlStr.toString();
         if (str.startsWith(__ProxyOrigin + '/http')) return str;
         if (str.startsWith(__ProxyOrigin + '/')) {
             let path = str.slice(__ProxyOrigin.length);
-            if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } else { return str; }
+            if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } 
+            else { return str; }
         }
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
-    // 只保留对 WebSocket 的强行代理，彻底移除 fetch/XHR 原型劫持，依靠底层 SW 捕获网络，实现真正免杀
+    const _fetch = window.fetch;
+    window.fetch = async (u, opt) => {
+        try { if (u instanceof Request) u = new Request(toProxyUrl(u.url), u); else u = toProxyUrl(u); } catch(e) {}
+        if (opt && typeof opt === 'object' && !opt.credentials) opt.credentials = "include"; else if (!opt) opt = { credentials: "include" };
+        return _fetch(u, opt);
+    };
+
+    const _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(m, u, ...r) {
+        try { u = toProxyUrl(u); } catch(e) {} return _open.call(this, m, u, ...r);
+    };
+    const _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
+
+    // YouTube LiveChat 动态 WebSocket 捕获
     const _WebSocket = window.WebSocket;
     if (_WebSocket) {
         window.WebSocket = function(url, protocols) {
@@ -285,35 +336,25 @@ class InjectSandbox {
 
     const observer = new MutationObserver(mutations => {
         mutations.forEach(m => {
-            if (m.type === 'attributes') {
-                const attr = m.attributeName;
-                if (['href', 'src', 'action'].includes(attr)) {
-                    let val = m.target.getAttribute(attr);
-                    if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
-                        try { m.target.setAttribute(attr, toProxyUrl(val)); } catch(e){}
-                    }
-                }
-            }
-            if (m.type === 'childList') {
-                m.addedNodes.forEach(n => {
-                    if (n.nodeType === 1) { 
-                        const fixAttr = (node) => {['href', 'src', 'action'].forEach(attr => {
-                                if (node.hasAttribute && node.hasAttribute(attr)) {
-                                    let val = node.getAttribute(attr);
-                                    if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
-                                        try { node.setAttribute(attr, toProxyUrl(val)); } catch(e){}
-                                    }
+            m.addedNodes.forEach(n => {
+                if (n.nodeType === 1) { 
+                    const fixAttr = (node) => {
+                        ['href', 'src', 'action'].forEach(attr => {
+                            if (node.hasAttribute && node.hasAttribute(attr)) {
+                                let val = node.getAttribute(attr);
+                                if (val && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
+                                    try { node.setAttribute(attr, toProxyUrl(val)); } catch(e){}
                                 }
-                            });
-                        };
-                        fixAttr(n);
-                        if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
-                    }
-                });
-            }
+                            }
+                        });
+                    };
+                    fixAttr(n);
+                    if (n.querySelectorAll) n.querySelectorAll('[href],[src],[action]').forEach(fixAttr);
+                }
+            });
         });
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter:['src', 'href', 'action'] });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
 
     if("serviceWorker" in navigator) { window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => 0)); }
 })();
