@@ -1,4 +1,4 @@
-// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v26)
+// dist/_worker.js (Cloudflare Pages Worker - Industrial Final v27)
 
 const MAX_REWRITE_SIZE = 15 * 1024 * 1024;
 
@@ -60,8 +60,8 @@ async function handleRequest(request, env) {
     headers.set("Host", target.host);
 
     // ==========================================
-    // 【终极黑科技：Elite Proxy 高匿模式开启】
-    // 抹除一切代理指纹，让 Whoer 侦测失效，让 YouTube 机器人防护网彻底瞎眼！
+    // 【核心黑科技：Elite Proxy 高匿模式开启】
+    // 强制丢弃一切 Cloudflare 及代理追踪头，彻底解决 Whoer.net 暴露与 YouTube 机器人拦截！
     // ==========================================
     const proxyHeaders =[
         "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto",
@@ -69,17 +69,23 @@ async function handleRequest(request, env) {
     ];
     proxyHeaders.forEach(h => headers.delete(h));
 
-    // 智能动态镜像来源（替换原版的写死方案，完美兼容 YouTube SPA 动态单页路由验证）
+    // 精准复原 Origin 与 Referer，骗过严格的后端 CSRF 防护
     let reqOrigin = headers.get("Origin");
-    if (reqOrigin && reqOrigin.includes(url.host)) {
-        headers.set("Origin", reqOrigin.replace(url.origin, target.origin));
-    } else if (!reqOrigin && request.method !== 'GET') {
+    if (reqOrigin === url.origin) {
         headers.set("Origin", target.origin);
     }
 
-    let reqReferer = headers.get("Referer");
-    if (reqReferer && reqReferer.includes(url.host)) {
-        headers.set("Referer", reqReferer.replace(url.origin, target.origin));
+    const clientReferer = headers.get("Referer");
+    if (clientReferer) {
+        try {
+            const parsedClientRef = new URL(clientReferer);
+            let refPath = clientReferer.slice(parsedClientRef.origin.length).replace(/^\/+/, "");
+            if (refPath.startsWith("http://") || refPath.startsWith("https://")) { 
+                headers.set("Referer", refPath); 
+            } else {
+                headers.set("Referer", target.origin + "/" + refPath);
+            }
+        } catch { headers.set("Referer", target.href); }
     } else {
         headers.set("Referer", target.href);
     }
@@ -98,8 +104,9 @@ async function handleRequest(request, env) {
     const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCSS = contentType.includes("text/css");
     const isXML = contentType.includes("xml") || clean.endsWith(".xml") || clean.endsWith("robots.txt");
-    const isJS = contentType.includes("javascript") || clean.endsWith(".js");
-    const shouldRewriteBody = (isHTML || isCSS || isXML || isJS) && contentLength < MAX_REWRITE_SIZE;
+    
+    // 【终极重构】直接放行 JS，不注入任何 Hook，解决代码破损，让 BotGuard 查无此人！
+    const shouldRewriteBody = (isHTML || isCSS || isXML) && contentLength < MAX_REWRITE_SIZE;
 
     sanitizeAndExposeHeaders(newHeaders, request, shouldRewriteBody);
     rewriteLocation(response, newHeaders, url, target);
@@ -121,7 +128,6 @@ async function handleRequest(request, env) {
     if (isHTML) return rewriteHTML(response, newHeaders, url, target);
     if (isXML) return rewriteTextResource(response, newHeaders, url, target);
     if (isCSS) return rewriteCSSResponse(response, newHeaders, url, target);
-    if (isJS) return rewriteJSResponse(response, newHeaders, url, target);
 
     return new Response(response.body, { status: response.status, headers: newHeaders });
 }
@@ -177,74 +183,9 @@ async function rewriteCSSResponse(res, headers, proxy, target) {
     return new Response(css, { status: res.status, headers });
 }
 
-async function rewriteJSResponse(res, headers, proxy, target) {
-    let js = await res.text();
-    let trimmed = js.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) return new Response(js, { status: res.status, headers });
-    
-    if (target.hostname.includes("accounts.google.com") || target.hostname.includes("myaccount.google.com")) {
-        return new Response(js, { status: res.status, headers });
-    }
-
-    const hookCode = `
-;(function(){
-    if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope && !self.__UP_HOOKED) {
-        self.__UP_HOOKED = true;
-        const __ProxyOrigin = "${proxy.origin}";
-        const __TargetOrigin = "${target.origin}";
-        function toProxyUrl(urlStr) {
-            if (!urlStr) return urlStr; let str = urlStr.toString();
-            if (str.startsWith(__ProxyOrigin + '/http')) return str;
-            if (str.startsWith(__ProxyOrigin + '/')) {
-                let path = str.slice(__ProxyOrigin.length);
-                if (!path.startsWith('/http')) { try { return __ProxyOrigin + '/' + new URL(path, __TargetOrigin).href; } catch(e){} } else return str;
-            }
-            try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
-        }
-        const _fetch = self.fetch;
-        self.fetch = async function(resource, options) {
-            try {
-                let isReq = resource instanceof Request;
-                let origUrl = isReq ? resource.url : resource.toString();
-                let pUrl = toProxyUrl(origUrl);
-                
-                if (pUrl === origUrl) {
-                    if (options) { options.credentials = "include"; return _fetch(resource, options); }
-                    return _fetch(resource, { credentials: "include" });
-                }
-
-                if (isReq) {
-                    let newInit = options || {};
-                    newInit.credentials = newInit.credentials || "include";
-                    return _fetch(new Request(pUrl, resource), newInit);
-                } else {
-                    if (!options) options = {};
-                    options.credentials = options.credentials || "include";
-                    return _fetch(pUrl, options);
-                }
-            } catch (e) {
-                return _fetch(resource, options);
-            }
-        };
-        const _open = self.XMLHttpRequest.prototype.open;
-        self.XMLHttpRequest.prototype.open = function(m, u, ...r) {
-            try { u = toProxyUrl(u); } catch(e) {} return _open.call(this, m, u, ...r);
-        };
-        const _send = self.XMLHttpRequest.prototype.send;
-        self.XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
-    }
-})();
-`;
-    return new Response(hookCode + js, { status: res.status, headers });
-}
-
 function rewriteHTML(res, headers, proxy, target) {
-    let rewriter = new HTMLRewriter();
-    if (!target.hostname.includes("accounts.google.com") && !target.hostname.includes("myaccount.google.com")) {
-        rewriter = rewriter.on("head", new InjectSandbox(proxy, target));
-    }
-
-    return rewriter
+    let rewriter = new HTMLRewriter()
+        .on("head", new InjectSandbox(proxy, target))
         .on("script, link", new RemoveIntegrity())
         .on("link[rel='canonical'], link[rel='alternate'], base[href]", new URLRewriter(proxy, target, "href"))
         .on("meta[property='og:url'], meta[property='og:image'], meta[name='twitter:url'], meta[name='twitter:image']", new URLRewriter(proxy, target, "content"))
@@ -252,8 +193,9 @@ function rewriteHTML(res, headers, proxy, target) {
         .on("img[src], iframe[src], script[src], source[src]", new URLRewriter(proxy, target, "src"))
         .on("img[srcset], source[srcset]", new SrcsetRewriter(proxy, target))
         .on("form[action]", new URLRewriter(proxy, target, "action"))
-        .on("[data-src],[data-url],[data-href],[data-video],[data-aff],[data-poster]", new DataAttributeRewriter(proxy, target))
-        .transform(new Response(res.body, { status: res.status, headers }));
+        .on("[data-src],[data-url],[data-href],[data-video],[data-aff],[data-poster]", new DataAttributeRewriter(proxy, target));
+    
+    return rewriter.transform(new Response(res.body, { status: res.status, headers }));
 }
 
 class RemoveIntegrity { element(el) { el.removeAttribute("integrity"); } }
@@ -317,76 +259,7 @@ class InjectSandbox {
         try { return __ProxyOrigin + "/" + new URL(str, __TargetOrigin).href; } catch(e) { return str; }
     }
 
-    const origInnerHTML = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
-    if (origInnerHTML) {
-        Object.defineProperty(Element.prototype, 'innerHTML', {
-            get: function() { return origInnerHTML.get.call(this); },
-            set: function(val) {
-                if (typeof val === 'string') {
-                    val = val.replace(/(src|href|action)\\s*=\\s*(['"])(?!http|data:|javascript:|#|\\/\\/)([^'"]+)\\2/ig, (match, attr, quote, path) => {
-                        try { return attr + '=' + quote + toProxyUrl(path) + quote; } catch(e) { return match; }
-                    });
-                }
-                return origInnerHTML.set.call(this, val);
-            }
-        });
-    }
-
-    const hookProperty = (proto, prop) => {
-        if (!proto) return;
-        let desc = Object.getOwnPropertyDescriptor(proto, prop);
-        if (!desc || !desc.set) return;
-        Object.defineProperty(proto, prop, {
-            get: function() { return desc.get.call(this); },
-            set: function(val) {
-                if (val && typeof val === 'string' && !val.startsWith('javascript:') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith(__ProxyOrigin + '/http')) {
-                    try { val = toProxyUrl(val); } catch(e){}
-                }
-                return desc.set.call(this, val);
-            }
-        });
-    };
-    hookProperty(HTMLImageElement.prototype, 'src');
-    hookProperty(HTMLScriptElement.prototype, 'src');
-    hookProperty(HTMLAnchorElement.prototype, 'href');
-    hookProperty(HTMLFormElement.prototype, 'action');
-    hookProperty(HTMLIFrameElement.prototype, 'src');
-
-    // 【原生 Request 完美复刻】彻底解决导致 YouTube "Playback ID" 错误的 ReadableStream 克隆失败问题
-    const _fetch = window.fetch;
-    window.fetch = async function(resource, options) {
-        try {
-            let isReq = resource instanceof Request;
-            let origUrl = isReq ? resource.url : resource.toString();
-            let pUrl = toProxyUrl(origUrl);
-            
-            if (pUrl === origUrl) {
-                if (options) { options.credentials = "include"; return _fetch(resource, options); }
-                return _fetch(resource, { credentials: "include" });
-            }
-
-            if (isReq) {
-                let newInit = options || {};
-                newInit.credentials = newInit.credentials || "include";
-                // 使用原 Request 作为底本直接实例化，由浏览器底层无损转移数据流状态，绝生死锁
-                return _fetch(new Request(pUrl, resource), newInit);
-            } else {
-                if (!options) options = {};
-                options.credentials = options.credentials || "include";
-                return _fetch(pUrl, options);
-            }
-        } catch(e) {
-            return _fetch(resource, options);
-        }
-    };
-
-    const _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(m, u, ...r) {
-        try { u = toProxyUrl(u); } catch(e) {} return _open.call(this, m, u, ...r);
-    };
-    const _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function(b) { this.withCredentials = true; return _send.call(this, b); };
-
+    // 只保留对 WebSocket 的强行代理，彻底移除 fetch/XHR 原型劫持，依靠底层 SW 捕获网络，实现真正免杀
     const _WebSocket = window.WebSocket;
     if (_WebSocket) {
         window.WebSocket = function(url, protocols) {
