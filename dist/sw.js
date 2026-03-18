@@ -1,6 +1,6 @@
-// dist/sw.js (UPP Proxy Service Worker - Industrial Final v25)
+// dist/sw.js (UPP Proxy Service Worker - Industrial Final v27)
 
-const VERSION = "v1.0.0-202603182016";
+const VERSION = "v1.0.0-202603182037";
 const CACHE_PREFIX = "upp-cache-";
 const DYNAMIC_CACHE = `${CACHE_PREFIX}dynamic-${VERSION}`;
 const MAX_DYNAMIC_ITEMS = 120;
@@ -53,10 +53,11 @@ self.addEventListener("fetch", (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // 音视频媒体流直接放行，由底层原生处理，根绝断流与死锁
+    // 音视频流直接绕过 SW 处理，杜绝 59 秒断流及爆内存
     if (req.destination === 'video' || req.destination === 'audio') return; 
 
     event.respondWith((async () => {
+        // 捕获浏览器原生的相对路径请求
         if (url.origin === self.location.origin && !isProxyRequest(url)) {
             const p = url.pathname;
             if (p === '/' || p === '/sw.js' || p === '/favicon.ico' || p.startsWith('/_assets/')) return fetch(req); 
@@ -72,6 +73,7 @@ self.addEventListener("fetch", (event) => {
             return fetch(req); 
         }
 
+        // 捕获浏览器原生发起的绝对跨域请求（例如页面原生 fetch('https://youtube.com/api')）
         if (!isProxyRequest(url) && url.origin !== self.location.origin) {
             let correctUrl = `${self.location.origin}/${url.href}`;
             if (req.mode === 'navigate') return Response.redirect(correctUrl, 302);
@@ -92,7 +94,6 @@ self.addEventListener("fetch", (event) => {
 async function proxyNetworkFetch(req, targetUrl) {
     const fetchOpts = {
         method: req.method, headers: req.headers, 
-        // 【核心修复一】精准重定向分流：导航请求交还给浏览器原生处理 302，完美写入 Set-Cookie 解决 Typecho 退出死循环！AJAX 则自动跟随防止崩溃！
         redirect: req.mode === 'navigate' ? 'manual' : 'follow',
         mode: req.mode === 'navigate' ? 'same-origin' : req.mode,
         credentials: "include" 
